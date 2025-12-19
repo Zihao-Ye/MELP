@@ -19,7 +19,7 @@ from melp.models.melp_model import MELPModel
 from melp.models.ssl_finetuner import SSLFineTuner
 from melp.paths import ROOT_PATH as REPO_ROOT_DIR
 from melp.paths import RAW_DATA_PATH
-from melp.paths import VQNSP_CKPT_PATH
+# from melp.paths import VQNSP_CKPT_PATH
 
 warnings.filterwarnings("ignore")
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
@@ -129,7 +129,7 @@ if __name__ == '__main__':
                                  "ecgfm", "t5", "patchecg"])
     parser.add_argument("--dataset_name", type=str, default="ptbxl_super_class",
                         choices=["ptbxl_super_class", "ptbxl_sub_class", "ptbxl_form", "ptbxl_rhythm",
-                                 "icbeb", "chapman"])
+                                 "icbeb", "chapman", "anzhen"])
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--train_data_pct", type=float, default=1.)
     parser.add_argument("--batch_size", type=int, default=128)

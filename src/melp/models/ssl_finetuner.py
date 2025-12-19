@@ -4,7 +4,7 @@ import torch
 import torch.nn as nn
 from lightning import LightningModule
 import torch.nn.functional as F
-from torchmetrics import AUROC
+from torchmetrics import AUROC, F1Score, Precision, Recall
 from einops import rearrange
 
 
@@ -62,6 +62,33 @@ class SSLFineTuner(LightningModule):
         self.val_auc = AUROC(task="multilabel", num_labels=num_classes)
         self.test_auc = AUROC(task="multilabel", num_labels=num_classes)
 
+        # # F1分数 (macro和micro)
+        # self.train_f1_macro = F1Score(task="multilabel", num_labels=num_classes, average='macro')
+        # self.train_f1_micro = F1Score(task="multilabel", num_labels=num_classes, average='micro')
+        # self.val_f1_macro = F1Score(task="multilabel", num_labels=num_classes, average='macro')
+        # self.val_f1_micro = F1Score(task="multilabel", num_labels=num_classes, average='micro')
+        # self.test_f1_macro = F1Score(task="multilabel", num_labels=num_classes, average='macro')
+        # self.test_f1_micro = F1Score(task="multilabel", num_labels=num_classes, average='micro')
+
+        # # === 新增：per-label 指标（仅用于 val/test epoch end）===
+        # self.val_per_label_metrics = nn.ModuleDict({
+        #     'auc': AUROC(task="multilabel", num_labels=num_classes, average=None),
+        #     'f1': F1Score(task="multilabel", num_labels=num_classes, average=None),
+        #     'precision': Precision(task="multilabel", num_labels=num_classes, average=None),
+        #     'recall': Recall(task="multilabel", num_labels=num_classes, average=None),
+        # })
+
+        # self.test_per_label_metrics = nn.ModuleDict({
+        #     'auc': AUROC(task="multilabel", num_labels=num_classes, average=None),
+        #     'f1': F1Score(task="multilabel", num_labels=num_classes, average=None),
+        #     'precision': Precision(task="multilabel", num_labels=num_classes, average=None),
+        #     'recall': Recall(task="multilabel", num_labels=num_classes, average=None),
+        # })
+
+        # # 缓存 logits 和 targets 用于 epoch-end 计算（可选，但更稳定）
+        # self.val_outputs = []
+        # self.test_outputs = []
+
     def on_train_epoch_start(self) -> None:
         self.backbone.eval()
 
@@ -73,6 +100,21 @@ class SSLFineTuner(LightningModule):
         self.log("train_auc_step", auc, prog_bar=True)
         self.log("train_auc_epoch", self.train_auc)
 
+        # # 多标签预测：sigmoid激活
+        # probs = torch.sigmoid(logits)
+        # pred = (probs > 0.5).float()
+
+        # # 计算指标
+        # auc = self.train_auc(probs, y.long())
+        # f1_macro = self.train_f1_macro(pred, y.long())
+        # f1_micro = self.train_f1_micro(pred, y.long())
+
+        # self.log("train_loss", loss, prog_bar=True)
+        # self.log("train_auc_step", auc, prog_bar=True)
+        # self.log("train_auc_epoch", self.train_auc)
+        # self.log("train_f1_macro", f1_macro, prog_bar=True)
+        # self.log("train_f1_micro", f1_micro, prog_bar=False)
+
         return loss
 
     def validation_step(self, batch, batch_idx):
@@ -81,6 +123,23 @@ class SSLFineTuner(LightningModule):
 
         self.log("val_loss", loss, prog_bar=True, sync_dist=True)
         self.log("val_auc", self.val_auc)
+
+        # # 多标签预测：sigmoid激活
+        # probs = torch.sigmoid(logits)
+        # pred = (probs > 0.5).float()
+
+        # # 更新验证指标
+        # self.val_auc(probs, y.long())
+        # self.val_f1_macro(pred, y.long())
+        # self.val_f1_micro(pred, y.long())
+
+        # self.log("val_loss", loss, prog_bar=True, sync_dist=True)
+        # self.log("val_auc", self.val_auc, prog_bar=True)
+        # self.log("val_f1_macro", self.val_f1_macro, prog_bar=True)
+        # self.log("val_f1_micro", self.val_f1_micro, prog_bar=False)
+
+        #  # 缓存用于 epoch-end per-label 计算（避免 metric 内部 reset 问题）
+        # self.val_outputs.append((logits.detach(), y.detach()))
 
         return loss
 
@@ -91,7 +150,80 @@ class SSLFineTuner(LightningModule):
         self.log("test_loss", loss, sync_dist=True)
         self.log("test_auc", self.test_auc)
 
+        # 多标签预测：sigmoid激活
+        probs = torch.sigmoid(logits)
+        pred = (probs > 0.5).float()
+
+        # # 更新测试指标
+        # self.test_auc(probs, y.long())
+        # self.test_f1_macro(pred, y.long())
+        # self.test_f1_micro(pred, y.long())
+
+        # self.log("test_loss", loss, sync_dist=True)
+        # self.log("test_auc", self.test_auc)
+        # self.log("test_f1_macro", self.test_f1_macro)
+        # self.log("test_f1_micro", self.test_f1_micro)
+
+        # self.test_outputs.append((logits.detach(), y.detach()))
+
         return loss
+
+    # def on_validation_epoch_end(self):
+    #     # Log overall metrics
+    #     self.log("val_auc", self.val_auc, prog_bar=True)
+    #     self.log("val_f1_macro", self.val_f1_macro, prog_bar=True)
+    #     self.log("val_f1_micro", self.val_f1_micro, prog_bar=False)
+
+    #     # Compute and log per-label metrics
+    #     if self.val_outputs:
+    #         logits = torch.cat([out[0] for out in self.val_outputs], dim=0)
+    #         targets = torch.cat([out[1] for out in self.val_outputs], dim=0)
+
+    #         probs = torch.sigmoid(logits)
+    #         pred = (probs > 0.5).float()
+
+    #         # AUC 需要 probs/logits，其他需要 pred
+    #         per_label_auc = self.val_per_label_metrics['auc'](probs, targets.long())
+    #         per_label_f1 = self.val_per_label_metrics['f1'](pred, targets.long())
+    #         per_label_prec = self.val_per_label_metrics['precision'](pred, targets.long())
+    #         per_label_rec = self.val_per_label_metrics['recall'](pred, targets.long())
+
+    #         # Log each label's metrics (e.g., val_auc_label_0, val_f1_label_1, ...)
+    #         num_labels = per_label_auc.shape[0]
+    #         for i in range(num_labels):
+    #             self.log(f"val_auc_label_{i}", per_label_auc[i], sync_dist=True)
+    #             self.log(f"val_f1_label_{i}", per_label_f1[i], sync_dist=True)
+    #             self.log(f"val_precision_label_{i}", per_label_prec[i], sync_dist=True)
+    #             self.log(f"val_recall_label_{i}", per_label_rec[i], sync_dist=True)
+
+    #         # Clear cache
+    #         self.val_outputs.clear()
+
+    # def on_test_epoch_end(self):
+    #     self.log("test_auc", self.test_auc)
+    #     self.log("test_f1_macro", self.test_f1_macro)
+    #     self.log("test_f1_micro", self.test_f1_micro)
+
+    #     if self.test_outputs:
+    #         logits = torch.cat([out[0] for out in self.test_outputs], dim=0)
+    #         targets = torch.cat([out[1] for out in self.test_outputs], dim=0)
+
+    #         probs = torch.sigmoid(logits)
+    #         pred = (probs > 0.5).float()
+
+    #         per_label_auc = self.test_per_label_metrics['auc'](probs, targets.long())
+    #         per_label_f1 = self.test_per_label_metrics['f1'](pred, targets.long())
+    #         per_label_prec = self.test_per_label_metrics['precision'](pred, targets.long())
+    #         per_label_rec = self.test_per_label_metrics['recall'](pred, targets.long())
+
+    #         num_labels = per_label_auc.shape[0]
+    #         for i in range(num_labels):
+    #             self.log(f"test_auc_label_{i}", per_label_auc[i])
+    #             self.log(f"test_f1_label_{i}", per_label_f1[i])
+    #             self.log(f"test_precision_label_{i}", per_label_prec[i])
+    #             self.log(f"test_recall_label_{i}", per_label_rec[i])
+
+    #         self.test_outputs.clear()
 
     def shared_step(self, batch):
         # Extract features from the backbone

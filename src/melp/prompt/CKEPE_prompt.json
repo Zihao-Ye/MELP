@@ -129,5 +129,6 @@
     "AT": "Atrial Tachycardia, Atrial Tachycardia with block, Atrial Tachycardia with flutter waves, Orthodromic Atrial Tachycardia, Antidromic Atrial Tachycardia.",
     "AVNRT": "AV Node Reentrant Tachycardia, AV nodal reentrant tachycardia, Supraventricular tachycardia, Narrow complex tachycardia.",
     "AVRT": "AV Reentrant Tachycardia, AV nodal reentrant tachycardia, atrioventricular reentrant tachycardia, supraventricular tachycardia with aberrancy.",
-    "SAAWR": "Sinus Atrium to Atrial Wandering Rhythm, Sinus Atrial Wandering Rhythm, Atrial Wandering Rhythm, Sinus-Atrial-Wandering-Rhythm.."
+    "SAAWR": "Sinus Atrium to Atrial Wandering Rhythm, Sinus Atrial Wandering Rhythm, Atrial Wandering Rhythm, Sinus-Atrial-Wandering-Rhythm..",
+    "VT": "ventricular tachycardia, monomorphic ventricular tachycardia, polymorphic ventricular tachycardia, sustained VT, non-sustained VT, idiopathic VT, fascicular tachycardia, RVOT tachycardia"
 }

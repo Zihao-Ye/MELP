@@ -83,6 +83,16 @@ class ECGDataset(Dataset):
                 self.x = np.array(f['tracings'])
             
             self.labels = csv_file.values
+        elif self.dataset_name == 'anzhen':
+            # 假设最后20列是one-hot标签，前面有ecg_id, patient_id, record_name等元数据
+            self.labels_name = list(csv_file.columns[-18:])  # 最后19列是标签
+            self.num_classes = len(self.labels_name)
+            self.labels = csv_file.iloc[:, -18:].values  # 最后19列作为标签
+
+            # patient_id默认为record_name
+            self.patient_id = csv_file['record_name']
+            self.ecg_id = csv_file['record_name']
+            self.ecg_path = csv_file['record_name'].apply(lambda x: 'wfdb_output/' + x)
         else:
             raise ValueError("dataset_type should be either 'ptbxl' or 'icbeb' or 'chapman")
 
@@ -107,7 +117,23 @@ class ECGDataset(Dataset):
             ecg_id = self.ecg_id[idx]
             patient_id = self.patient_id[idx]
             uid = f"{patient_id}_{ecg_id}"
-            
+        
+        elif self.dataset_name == 'anzhen':
+            ecg_path = os.path.join(self.data_path, self.ecg_path.iloc[idx])
+
+            ecg = wfdb.rdsamp(ecg_path)[0]
+            ecg = ecg.T
+            ecg = ecg[:, :2500]
+            # normalzie to 0-1
+            ecg = (ecg - np.min(ecg))/(np.max(ecg) - np.min(ecg) + 1e-8)
+
+            ecg = torch.from_numpy(ecg).float()
+            target = self.labels[idx]
+            target = torch.from_numpy(target).float()
+            ecg_id = self.ecg_id[idx]
+            patient_id = self.patient_id[idx]
+            uid = f"{patient_id}_{ecg_id}"
+
         elif self.dataset_name == 'icbeb':
             ecg_path = os.path.join(self.data_path, self.ecg_path.iloc[idx])
             # icbeb has dat file, which is the raw ecg data

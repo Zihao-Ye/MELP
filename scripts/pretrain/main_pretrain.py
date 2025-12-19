@@ -163,6 +163,8 @@ if __name__ == '__main__':
     parser.add_argument("--val_dataset_list", type=str, nargs="+", 
                         default=["ptbxl_super_class", "ptbxl_sub_class", "ptbxl_form", "ptbxl_rhythm", 
                                   "icbeb", "chapman"])
+    # parser.add_argument("--val_dataset_list", type=str, nargs="+", 
+    #                     default=["ptbxl_super_class", "ptbxl_sub_class", "ptbxl_form", "ptbxl_rhythm"])
 
     hparams = parser.parse_args()
 

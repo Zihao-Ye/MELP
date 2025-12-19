@@ -10,8 +10,8 @@ from pprint import pprint
 from tqdm import tqdm
 import multiprocessing as mp
 import sys
-from mmecg.paths import RAW_DATA_PATH, PROCESSED_DATA_PATH
-from mmecg.paths import ROOT_PATH as REPO_ROOT_DIR
+from melp.paths import RAW_DATA_PATH, PROCESSED_DATA_PATH
+from melp.paths import ROOT_PATH as REPO_ROOT_DIR
 
 '''
 python preprocess_mimic_iv_ecg.py
@@ -65,7 +65,7 @@ def process_record(p, uid, meta_path, save_path):
         assert np.isnan(denoised_record).sum() == 0 and np.isinf(denoised_record).sum() == 0, f"Found NaN or Inf in the denoised record: {uid}"
 
         # store the data
-        np.save(save_path / f"{uid}.npy", denoised_record[:, :5000])
+        np.save(save_path + f"/{uid}.npy", denoised_record[:, :5000])
     else:
         # Do not process the record if it contains NaN or Inf
         return 
@@ -135,22 +135,22 @@ def main():
     save_dir = PROCESSED_DATA_PATH / "mimic-iv-ecg/records"
     os.makedirs(save_dir, exist_ok=True)
 
-    # for _, row in tqdm(record_csv.iterrows(), total=len(record_csv)):
-    #     process_record(row["path"], row["id"], str(RAW_DATA_PATH / 'mimic-iv-ecg'), save_dir)
+    for _, row in tqdm(record_csv.iterrows(), total=len(record_csv)):
+        process_record(row["path"], row["id"], str(RAW_DATA_PATH / 'mimic-iv-ecg'), save_dir)
 
-    # # Create a pool of workers
-    # pool = mp.Pool(processes=32)
-    # meta_path = str(RAW_DATA_PATH / 'mimic-iv-ecg')
-    # # Process records in parallel
-    # results = list(tqdm(pool.imap(process_record_wrapper, 
-    #             [(row["path"], row["id"], meta_path, save_dir) for _, row in record_csv.iterrows()]), 
-    #         total=len(record_csv)))
-    # # Close the pool
-    # pool.close()
-    # pool.join()
+    # Create a pool of workers
+    pool = mp.Pool(processes=32)
+    meta_path = str(RAW_DATA_PATH / 'mimic-iv-ecg')
+    # Process records in parallel
+    results = list(tqdm(pool.imap(process_record_wrapper, 
+                [(row["path"], row["id"], meta_path, save_dir) for _, row in record_csv.iterrows()]), 
+            total=len(record_csv)))
+    # Close the pool
+    pool.close()
+    pool.join()
 
     print("Step 3: Preprocessing records...")
-    saved_npys = glob(str(save_dir / "*.npy"))
+    saved_npys = glob(str(save_dir + "/*.npy"))
     report_csv = report_csv[report_csv["id"].isin([os.path.basename(f).split(".")[0] for f in saved_npys])]
     report_csv.reset_index(drop=True, inplace=True)
 
@@ -158,9 +158,10 @@ def main():
     report_csv = report_csv.merge(record_csv, on="id", how="inner")
     
     # split csv to train and val
-    split_dir = REPO_ROOT_DIR / "src/mmecg/data_split/mimic-iv-ecg"
+    split_dir = str(REPO_ROOT_DIR) + "/src/melp/data_split/mimic-iv-ecg"
     os.makedirs(split_dir, exist_ok=True)
     unique_subject_ids = report_csv["subject_id"].unique()
+    print(len(unique_subject_ids))
     # split should be done based on subject_id instead of rows ...
     train_subject_ids, val_subject_ids = train_test_split(unique_subject_ids, test_size=0.02, random_state=42)
     train_csv = report_csv[report_csv["subject_id"].isin(train_subject_ids)]
@@ -168,8 +169,8 @@ def main():
     print(f"Train size: {train_csv.shape[0]}, Val size: {val_csv.shape[0]}")
     train_csv.reset_index(drop=True, inplace=True)
     val_csv.reset_index(drop=True, inplace=True)
-    train_csv.to_csv(split_dir / "train.csv", index=False)
-    val_csv.to_csv(split_dir / "val.csv", index=False)
+    train_csv.to_csv(split_dir + "/train.csv", index=False)
+    val_csv.to_csv(split_dir + "/val.csv", index=False)
 
 
 if __name__ == "__main__":

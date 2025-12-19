@@ -17,7 +17,7 @@ class ECGDataModule(LightningDataModule):
         self.num_workers = num_workers
         self.train_data_pct = train_data_pct
         assert dataset_name in ["ptbxl_super_class", "ptbxl_sub_class", "ptbxl_form", "ptbxl_rhythm", 
-                                "icbeb", "chapman", "code"], f"Invalid dataset name {self.dataset_name} found"
+                                "icbeb", "chapman", "code", "anzhen"], f"Invalid dataset name {self.dataset_name} found"
         self.dataset_name = dataset_name
         self.dataset_dir = dataset_dir
         if "ptbxl" in dataset_name:
