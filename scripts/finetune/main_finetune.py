@@ -43,8 +43,8 @@ def main(hparams: Namespace):
     now = datetime.datetime.now(tz.tzlocal())
     extension = now.strftime("%Y_%m_%d_%H_%M_%S")
     extension = f"melp_finetune_{hparams.model_name}_{extension}"
-    ckpt_dir = os.path.join(
-        REPO_ROOT_DIR, f"logs/melp_finetune/ckpts/{extension}")
+    ckpt_dir = os.path.expanduser(
+        f"~/autodl-tmp/logs/melp_finetune/ckpts/{extension}")
     os.makedirs(ckpt_dir, exist_ok=True)
     callbacks = [
         LearningRateMonitor(logging_interval="step"),
@@ -54,7 +54,7 @@ def main(hparams: Namespace):
         EarlyStopping(monitor="val_auc", min_delta=0,
                       patience=5, verbose=False, mode="max"),
     ]
-    logger_dir = os.path.join(REPO_ROOT_DIR, "logs/melp_finetune")
+    logger_dir = os.path.expanduser("~/autodl-tmp/logs/melp_finetune")
     os.makedirs(logger_dir, exist_ok=True)
     wandb_logger = WandbLogger(
         project="melp_finetune", save_dir=logger_dir, name=extension)

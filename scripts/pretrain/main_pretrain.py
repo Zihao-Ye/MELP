@@ -42,8 +42,8 @@ def main(hparams: Namespace):
     now = datetime.datetime.now(tz.tzlocal())
     extension = now.strftime("%Y_%m_%d_%H_%M_%S")
     extension = f"melp_{hparams.model_name}_{extension}"
-    ckpt_dir = os.path.join(
-        REPO_ROOT_DIR, f"logs/melp/ckpts/{extension}")
+    ckpt_dir = os.path.expanduser(
+        f"~/autodl-tmp/logs/melp/ckpts/{extension}")
     os.makedirs(ckpt_dir, exist_ok=True)
     if hparams.model_name in ["merl", "melp"]:
         callbacks = [
@@ -65,7 +65,7 @@ def main(hparams: Namespace):
         ]
     else:
         raise NotImplementedError
-    logger_dir = os.path.join(REPO_ROOT_DIR, "logs/melp")
+    logger_dir = os.path.expanduser("~/autodl-tmp/logs/melp")
     os.makedirs(logger_dir, exist_ok=True)
     wandb_logger = WandbLogger(
         project="melp", save_dir=logger_dir, name=extension)
@@ -83,8 +83,8 @@ def main(hparams: Namespace):
     # ------------------------
     # 2 INIT LIGHTNING MODEL and lightning datamodule
     # ------------------------
-    hparams.exp_log_dir = os.path.join(
-        REPO_ROOT_DIR, f"data/{extension}/exp_logs")
+    hparams.exp_log_dir = os.path.expanduser(
+        f"~/autodl-tmp/logs/melp/exp_logs/{extension}")
     
     if hparams.model_name == "merl":
         datamodule = ECGTextDataModule(
@@ -129,12 +129,12 @@ def main(hparams: Namespace):
     # 3 START TRAINING
     # ------------------------
     # tuner = Tuner(trainer)
-    # Find optimal batch size
+    # # Find optimal batch size
     # optimal_batch_size = tuner.scale_batch_size(model=model, datamodule=datamodule, init_val=128,
     #                                             mode="binsearch")
     # datamodule.batch_size = optimal_batch_size
     # print(f"Optimal batch size: {optimal_batch_size}")
-    # Find optimal learning rate
+    # # Find optimal learning rate
     # lr_finder = tuner.lr_find(model=model, datamodule=datamodule, max_lr=1e-3)
     # model.lr = lr_finder.suggestion()
     trainer.fit(model, datamodule=datamodule)
