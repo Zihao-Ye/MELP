@@ -248,12 +248,12 @@ class MERLModel(BasePretrainModel):
             texts = texts.lower()
             texts = [texts] # convert to list
             texts = self._tokenize(texts) # tokenize
-            # class_embeddings = self.get_text_emb(texts.input_ids.type_as(self.logit_scale).long(),
-            #                                      texts.attention_mask.type_as(self.logit_scale).long(),
-            #                                     ) # embed with text encoder
-            class_embeddings = self.encode_text(texts.input_ids.type_as(self.logit_scale).long(),
-                                                texts.attention_mask.type_as(self.logit_scale).long(),
-                                               )
+            class_embeddings = self.get_text_emb(texts['input_ids'].type_as(self.logit_scale).long(),
+                                                 texts['attention_mask'].type_as(self.logit_scale).long(),
+                                                ) # embed with text encoder
+            # class_embeddings = self.encode_text(texts['input_ids'].type_as(self.logit_scale).long(),
+            #                                     texts['attention_mask'].type_as(self.logit_scale).long(),
+            #                                    )
 
             # normalize class_embeddings
             class_embeddings /= class_embeddings.norm(dim=-1, keepdim=True)

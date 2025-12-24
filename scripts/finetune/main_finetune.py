@@ -65,7 +65,7 @@ def main(hparams: Namespace):
         deterministic=True,
         devices=hparams.num_devices,
         strategy="ddp_find_unused_parameters_true",
-        precision="bf16-mixed",
+        precision=32,
         callbacks=callbacks,
         logger=wandb_logger
     )
@@ -87,9 +87,9 @@ def main(hparams: Namespace):
     hparams.training_steps_per_epoch = len(datamodule.train_dataloader()) // hparams.accumulate_grad_batches // hparams.num_devices
     if hparams.model_name == "merl":
         if hparams.ckpt_path:
-            # pretrain_model = MERLModel.load_from_checkpoint(hparams.ckpt_path)
-            pretrain_model = MERLModel()
-            pretrain_model.ecg_encoder.load_state_dict(torch.load(hparams.ckpt_path))
+            pretrain_model = MERLModel.load_from_checkpoint(hparams.ckpt_path)
+            # pretrain_model = MERLModel()
+            # pretrain_model.ecg_encoder.load_state_dict(torch.load(hparams.ckpt_path))
         else:
             pretrain_model = MERLModel()
         hparams.in_features = pretrain_model.proj_out
@@ -99,7 +99,7 @@ def main(hparams: Namespace):
                 hparams.ckpt_path)
         else:
             pretrain_model = ECGFMModel()
-        hparams.in_features = 1024
+        hparams.in_features = 768
     elif hparams.model_name == "melp":
         if hparams.ckpt_path:
             pretrain_model = MELPModel.load_from_checkpoint(hparams.ckpt_path)

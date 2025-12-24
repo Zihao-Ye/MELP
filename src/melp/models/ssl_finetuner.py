@@ -94,7 +94,8 @@ class SSLFineTuner(LightningModule):
 
     def training_step(self, batch, batch_idx):
         loss, logits, y = self.shared_step(batch)
-        auc = self.train_auc(logits.softmax(-1), y.long())
+        # auc = self.train_auc(logits.softmax(-1), y.long())  # 旧方案：使用softmax（不适合多标签分类）
+        auc = self.train_auc(logits, y.long())  # 新方案：直接使用logits，与pretrain保持一致
 
         self.log("train_loss", loss, prog_bar=True)
         self.log("train_auc_step", auc, prog_bar=True)
@@ -119,7 +120,8 @@ class SSLFineTuner(LightningModule):
 
     def validation_step(self, batch, batch_idx):
         loss, logits, y = self.shared_step(batch)
-        self.val_auc(logits.softmax(-1), y.long())
+        # self.val_auc(logits.softmax(-1), y.long())  # 旧方案：使用softmax（不适合多标签分类）
+        self.val_auc(logits, y.long())  # 新方案：直接使用logits，与pretrain保持一致
 
         self.log("val_loss", loss, prog_bar=True, sync_dist=True)
         self.log("val_auc", self.val_auc)
@@ -145,14 +147,15 @@ class SSLFineTuner(LightningModule):
 
     def test_step(self, batch, batch_idx):
         loss, logits, y = self.shared_step(batch)
-        self.test_auc(logits.softmax(-1), y.long())
+        # self.test_auc(logits.softmax(-1), y.long())  # 旧方案：使用softmax（不适合多标签分类）
+        self.test_auc(logits, y.long())  # 新方案：直接使用logits，与pretrain保持一致
 
         self.log("test_loss", loss, sync_dist=True)
         self.log("test_auc", self.test_auc)
 
-        # 多标签预测：sigmoid激活
-        probs = torch.sigmoid(logits)
-        pred = (probs > 0.5).float()
+        # # 多标签预测：sigmoid激活
+        # probs = torch.sigmoid(logits)
+        # pred = (probs > 0.5).float()
 
         # # 更新测试指标
         # self.test_auc(probs, y.long())

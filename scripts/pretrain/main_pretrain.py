@@ -69,13 +69,23 @@ def main(hparams: Namespace):
     os.makedirs(logger_dir, exist_ok=True)
     wandb_logger = WandbLogger(
         project="melp", save_dir=logger_dir, name=extension)
+    # trainer = Trainer(
+    #     max_epochs=hparams.max_epochs,
+    #     accelerator="gpu",
+    #     accumulate_grad_batches=hparams.accumulate_grad_batches,
+    #     devices=hparams.num_devices,
+    #     strategy="ddp_find_unused_parameters_true",
+    #     precision=32 if hparams.model_name == "ecgfm" else "bf16-mixed",
+    #     callbacks=callbacks,
+    #     logger=wandb_logger
+    # )
     trainer = Trainer(
         max_epochs=hparams.max_epochs,
         accelerator="gpu",
         accumulate_grad_batches=hparams.accumulate_grad_batches,
         devices=hparams.num_devices,
         strategy="ddp_find_unused_parameters_true",
-        precision=32 if hparams.model_name == "ecgfm" else "bf16-mixed",
+        precision=32,
         callbacks=callbacks,
         logger=wandb_logger
     )

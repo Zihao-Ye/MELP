@@ -48,7 +48,7 @@ ECG:
 cd scripts/pretrain
 CUDA_VISIBLE_DEVICES=0,1,2,3 python main_pretrain.py --num_devices 4 --train_data_pct 1 \
     --text_encoder_name ncbi/MedCPT-Query-Encoder \
-    --lr 2e-4 --model_name melp --batch_size 64 --max_epochs 100 \
+    --lr 2e-4 --model_name ecgfm --batch_size 64 --max_epochs 100 \
     --ecg_encoder_name ecgfm \
     --clip_loss_weight 1.0 --caption_loss_weight 2.0 --local_loss_weight 0.2
 ```

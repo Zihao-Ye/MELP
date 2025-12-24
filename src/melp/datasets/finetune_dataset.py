@@ -124,6 +124,11 @@ class ECGDataset(Dataset):
             ecg = wfdb.rdsamp(ecg_path)[0]
             ecg = ecg.T
             ecg = ecg[:, :2500]
+
+            # padding to 5000 to match the pre-trained data length
+            ecg = np.pad(ecg, ((0, 0), (0, 2500)), 'constant', constant_values=0)
+            ecg = ecg[:, :5000]
+            
             # normalzie to 0-1
             ecg = (ecg - np.min(ecg))/(np.max(ecg) - np.min(ecg) + 1e-8)
 
