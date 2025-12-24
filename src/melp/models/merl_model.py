@@ -14,7 +14,7 @@ from melp.backbone.vit1d import vit_tiny, vit_small, vit_middle, vit_base
 from melp.backbone.pooling import AttentionPool2d
 from melp.models.base_pretrain_model import BasePretrainModel
 # from melp.utils.utils_loss import clip_loss
-from melp.utils.openclip_loss import ClipLoss
+from melp.utils.openclip_loss import ClipLoss, SoftClipLoss
 from melp.paths import PROMPT_PATH, DATASET_LABELS_PATH
 
 
@@ -257,14 +257,51 @@ class MERLModel(BasePretrainModel):
 
             # normalize class_embeddings
             class_embeddings /= class_embeddings.norm(dim=-1, keepdim=True)
-            # average over templates 
-            class_embedding = class_embeddings.mean(dim=0) 
+            # average over templates
+            class_embedding = class_embeddings.mean(dim=0)
             # norm over new averaged templates
-            class_embedding /= class_embedding.norm() 
+            class_embedding /= class_embedding.norm()
             zeroshot_weights.append(class_embedding)
         zeroshot_weights = torch.stack(zeroshot_weights, dim=1)
 
         return zeroshot_weights
+
+    @torch.no_grad()
+    def compute_text_similarity(self, texts: List[str]):
+        """
+        Compute pairwise text similarity matrix using the text encoder.
+
+        Args:
+            texts: List of text strings [batch_size]
+
+        Returns:
+            similarity_matrix: Pairwise cosine similarity [batch_size, batch_size]
+        """
+        # Tokenize texts
+        tokenized = self._tokenize(texts)
+        input_ids = tokenized['input_ids'].type_as(self.logit_scale).long()
+        attention_mask = tokenized['attention_mask'].type_as(self.logit_scale).long()
+
+        # Get text embeddings using existing text encoder
+        if self.text_encoder_name == "ncbi/MedCPT-Query-Encoder":
+            text_embeddings = self.lm_model(input_ids=input_ids, attention_mask=attention_mask).pooler_output
+        elif self.text_encoder_name in ["google/flan-t5-small", "google/flan-t5-base"]:
+            sequence_output = self.lm_model(input_ids=input_ids, attention_mask=attention_mask).last_hidden_state
+            eos_mask = input_ids.eq(self.lm_model.config.eos_token_id).type_as(attention_mask).bool()
+            if len(torch.unique_consecutive(eos_mask.sum(1))) > 1:
+                raise ValueError("All examples must have the same number of <eos> tokens.")
+            batch_size, _, hidden_size = sequence_output.shape
+            text_embeddings = sequence_output[eos_mask, :].view(batch_size, -1, hidden_size)[:, -1, :]
+        else:
+            raise NotImplementedError
+
+        # Normalize embeddings
+        text_embeddings = F.normalize(text_embeddings, dim=-1)
+
+        # Compute pairwise cosine similarity
+        similarity_matrix = text_embeddings @ text_embeddings.T
+
+        return similarity_matrix
     
     def shared_step(self, batch, batch_idx):
         # only used in training_step now
@@ -275,7 +312,7 @@ class MERLModel(BasePretrainModel):
         attention_mask = tokenized_input['attention_mask'].type_as(batch['ecg']).long()
         text_output = self.encode_text(input_ids, attention_mask)
 
-        # write infonce loss for lightning 
+        # write infonce loss for lightning
         loss = ClipLoss(
             local_loss=True,
             gather_with_grad=True,
@@ -285,14 +322,38 @@ class MERLModel(BasePretrainModel):
             use_horovod=False
         )
 
-        cma_loss = loss(
-            ecg_output['proj_ecg_emb'], text_output['proj_text_emb'], self.logit_scale.exp())
+        # Original hard-label CMA loss (commented out)
+        # cma_loss = loss(
+        #     ecg_output['proj_ecg_emb'], text_output['proj_text_emb'], self.logit_scale.exp())
+
+        # Compute text similarity matrix for soft-label contrastive learning
+        text_sim_matrix = self.compute_text_similarity(batch['report'])
+
+        # Soft-label CMA (Cross-Modal Alignment) loss
+        soft_clip_loss = SoftClipLoss(
+            similarity_threshold=0.3,
+            soft_positive_weight=0.5,
+            local_loss=True,
+            gather_with_grad=True,
+            cache_labels=False,
+            rank=torch.distributed.get_rank(),
+            world_size=torch.distributed.get_world_size(),
+            use_horovod=False
+        )
+
+        soft_cma_loss = soft_clip_loss(
+            image_features=ecg_output['proj_ecg_emb'],
+            text_features=text_output['proj_text_emb'],
+            logit_scale=self.logit_scale.exp(),
+            text_sim_matrix=text_sim_matrix
+        )
+
         uma_loss = loss(
             ecg_output['ecg_emb1'], ecg_output['ecg_emb2'], torch.tensor(1 / 0.07))
 
         loss_dict = {
-            'loss': cma_loss + uma_loss,
-            'cma_loss': cma_loss,
+            'loss': soft_cma_loss + uma_loss,
+            'soft_cma_loss': soft_cma_loss,
             'uma_loss': uma_loss
         }
 
