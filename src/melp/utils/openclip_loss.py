@@ -173,16 +173,20 @@ class SoftClipLoss(nn.Module):
     """
     Soft-label contrastive learning loss for ECG-text pairs.
 
-    Uses text similarity to create soft labels instead of hard one-hot labels,
-    allowing partial positives for samples with overlapping diagnoses.
+    Uses pre-computed text similarity matrix (from medical LM embeddings like MedCPT)
+    to create soft labels, allowing partial positives for samples with overlapping diagnoses.
+
+    This design choice is deliberate:
+    - ClipLoss uses projected features (proj_text_emb) for alignment learning
+    - Soft labels use medical LM embeddings for stable semantic similarity
+    - This separation provides stable supervision while allowing feature learning
 
     Args:
-        text_sim_matrix: Pre-computed text similarity matrix [N, N] using MedCPT embeddings
         similarity_threshold: Threshold for considering samples as soft positives (default: 0.3)
         soft_positive_weight: Weight multiplier for soft positives (default: 0.5)
         local_loss: Whether to use local loss (only compute loss on local ECG features)
         gather_with_grad: Whether to gather features with gradient
-        cache_labels: Whether to cache labels
+        cache_labels: Not used (kept for API compatibility)
         rank: Current GPU rank
         world_size: Total number of GPUs
         use_horovod: Whether to use Horovod
@@ -194,7 +198,7 @@ class SoftClipLoss(nn.Module):
             soft_positive_weight=0.5,
             local_loss=True,
             gather_with_grad=True,
-            cache_labels=False,
+            cache_labels=False,  # unused but kept for compatibility
             rank=0,
             world_size=1,
             use_horovod=False,
@@ -204,40 +208,51 @@ class SoftClipLoss(nn.Module):
         self.soft_positive_weight = soft_positive_weight
         self.local_loss = local_loss
         self.gather_with_grad = gather_with_grad
-        self.cache_labels = cache_labels
         self.rank = rank
         self.world_size = world_size
         self.use_horovod = use_horovod
 
-        # cache state
-        self.prev_num_logits = 0
-        self.labels = {}
-
-    def build_soft_labels(self, text_sim_matrix, device):
+    def build_soft_labels(self, text_sim_matrix, device, num_logits):
         """
-        Build soft labels from text similarity matrix.
+        Build soft labels for contrastive loss.
 
         Args:
-            text_sim_matrix: Text similarity matrix [batch_size, batch_size] (local or global)
-            device: Target device
+            text_sim_matrix: [num_queries, num_classes]
+                - For image->text: [local_batch, global_batch]
+                - For text->image: [local_batch, global_batch] (after transpose logic handled outside)
+            device: target device
+            num_logits: local batch size (used to compute hard positive offset)
 
         Returns:
-            soft_labels: Soft label matrix [batch_size, batch_size]
-                - Diagonal (hard positives): 1.0
-                - Off-diagonal with sim > threshold: soft_positive_weight * similarity
+            soft_labels: same shape as text_sim_matrix
+                - Hard positive: 1.0
+                - Soft positive (sim > threshold): soft_positive_weight * sim
                 - Others: 0.0
         """
-        batch_size = text_sim_matrix.shape[0]
+        num_queries, num_classes = text_sim_matrix.shape
 
-        # Start with zeros
+        # Initialize soft labels
         soft_labels = torch.zeros_like(text_sim_matrix, device=device)
 
-        # Hard positives on diagonal
-        diag_indices = torch.arange(batch_size, device=device)
-        soft_labels[diag_indices, diag_indices] = 1.0
+        # Compute hard positive indices (same logic as ClipLoss.get_ground_truth)
+        row_indices = torch.arange(num_queries, device=device)
+        if self.world_size > 1 and self.local_loss:
+            col_indices = row_indices + num_logits * self.rank
+        else:
+            col_indices = row_indices  # global mode or single GPU
 
-        # Soft positives where similarity exceeds threshold
-        soft_mask = (text_sim_matrix > self.similarity_threshold) & ~torch.eye(batch_size, dtype=torch.bool, device=device)
+        # Clamp col_indices to valid range (in case of last batch mismatch, though rare)
+        col_indices = torch.clamp(col_indices, 0, num_classes - 1)
+
+        # Set hard positives
+        soft_labels[row_indices, col_indices] = 1.0
+
+        # Create mask for non-hard positions
+        diag_mask = torch.zeros_like(soft_labels, dtype=torch.bool)
+        diag_mask[row_indices, col_indices] = True
+
+        # Soft positives: similarity >= threshold AND not hard positive
+        soft_mask = (text_sim_matrix >= self.similarity_threshold) & (~diag_mask)
         soft_labels[soft_mask] = self.soft_positive_weight * text_sim_matrix[soft_mask]
 
         return soft_labels
@@ -250,41 +265,32 @@ class SoftClipLoss(nn.Module):
             text_sim_matrix: Local similarity matrix [local_batch, local_batch]
 
         Returns:
-            Gathered similarity matrix [local_batch, global_batch] or [global_batch, global_batch]
+            Gathered similarity matrix:
+                - For local_loss: [local_batch, global_batch]
+                - For global_loss: [global_batch, global_batch]
         """
         if self.world_size == 1:
             return text_sim_matrix
 
         assert has_distributed, 'torch.distributed did not import correctly'
 
-        # Gather along column (text) dimension first
-        if self.gather_with_grad:
-            gathered_sim = torch.distributed.nn.all_gather(text_sim_matrix)
-            all_sim = torch.cat(gathered_sim, dim=1)  # [local_batch, global_batch]
-        else:
-            gathered_sim = [torch.zeros_like(text_sim_matrix) for _ in range(self.world_size)]
-            dist.all_gather(gathered_sim, text_sim_matrix)
-            if not self.local_loss:
-                gathered_sim[self.rank] = text_sim_matrix
-            all_sim = torch.cat(gathered_sim, dim=1)
+        # Gather along column (text) dimension
+        gathered_sim = [torch.zeros_like(text_sim_matrix) for _ in range(self.world_size)]
+        dist.all_gather(gathered_sim, text_sim_matrix)
 
-        # If global loss, gather along row dimension too
+        # Concatenate along column dimension: [local_batch, global_batch]
+        all_sim = torch.cat(gathered_sim, dim=1)
+
+        # If global loss, also gather along row dimension
         if not self.local_loss:
-            if self.gather_with_grad:
-                gathered_rows = torch.distributed.nn.all_gather(all_sim)
-                all_sim = torch.cat(gathered_rows, dim=0)  # [global_batch, global_batch]
-            else:
-                gathered_rows = [torch.zeros_like(all_sim) for _ in range(self.world_size)]
-                dist.all_gather(gathered_rows, all_sim)
-                gathered_rows[self.rank] = all_sim
-                all_sim = torch.cat(gathered_rows, dim=0)
+            gathered_rows = [torch.zeros_like(all_sim) for _ in range(self.world_size)]
+            dist.all_gather(gathered_rows, all_sim)
+            all_sim = torch.cat(gathered_rows, dim=0)  # [global_batch, global_batch]
 
         return all_sim
 
     def get_logits(self, image_features, text_features, logit_scale):
-        """
-        Compute logits with multi-GPU gathering.
-        """
+        """Compute logits with multi-GPU gathering."""
         if self.world_size > 1:
             all_image_features, all_text_features = gather_features(
                 image_features,
@@ -310,25 +316,15 @@ class SoftClipLoss(nn.Module):
 
     def soft_cross_entropy(self, logits, soft_labels):
         """
-        Compute soft cross-entropy loss using KL divergence.
+        Compute soft cross-entropy loss WITHOUT normalizing soft_labels.
 
-        Args:
-            logits: Predicted logits [batch_size, num_classes]
-            soft_labels: Soft label distribution [batch_size, num_classes]
-
-        Returns:
-            loss: Scalar loss value
+        This preserves the relative importance of hard positives (weight=1.0)
+        vs soft positives (weight=soft_positive_weight * sim), providing stronger
+        supervision signal compared to normalized version.
         """
-        # Normalize soft labels to sum to 1 (probability distribution)
-        soft_labels_normalized = soft_labels / (soft_labels.sum(dim=1, keepdim=True) + 1e-8)
-
-        # Log softmax of logits
         log_probs = F.log_softmax(logits, dim=1)
-
-        # KL divergence: sum(p * log(p/q)) = sum(p * log(p)) - sum(p * log(q))
-        # We compute -sum(p * log(q)) which is the cross-entropy part
-        loss = -(soft_labels_normalized * log_probs).sum(dim=1).mean()
-
+        soft_targets = soft_labels / soft_labels.sum(dim=1, keepdim=True)
+        loss = -(soft_targets * log_probs).sum(dim=1).mean()
         return loss
 
     def forward(self, image_features, text_features, logit_scale, text_sim_matrix, output_dict=False):
@@ -336,10 +332,11 @@ class SoftClipLoss(nn.Module):
         Forward pass for soft-label contrastive learning.
 
         Args:
-            image_features: ECG features [batch_size, embed_dim]
-            text_features: Text features [batch_size, embed_dim]
-            logit_scale: Temperature parameter for contrastive learning
-            text_sim_matrix: Pre-computed text similarity matrix [batch_size, batch_size]
+            image_features: ECG features [local_batch, embed_dim]
+            text_features: Text features [local_batch, embed_dim]
+            logit_scale: Temperature parameter
+            text_sim_matrix: Pre-computed text similarity [local_batch, local_batch]
+                (computed from medical LM embeddings like MedCPT, NOT from proj_text_emb)
             output_dict: Whether to return dict or scalar
 
         Returns:
@@ -350,15 +347,198 @@ class SoftClipLoss(nn.Module):
         # Get logits (handles multi-GPU gathering)
         logits_per_image, logits_per_text = self.get_logits(image_features, text_features, logit_scale)
 
+        num_logits = logits_per_image.shape[0]  # local batch size
+
         # Gather text similarity matrix across GPUs
         if self.world_size > 1:
             gathered_text_sim = self.gather_text_similarity(text_sim_matrix)
         else:
             gathered_text_sim = text_sim_matrix
 
-        # Build soft labels from similarity matrix
-        soft_labels_image = self.build_soft_labels(gathered_text_sim, device)
-        soft_labels_text = self.build_soft_labels(gathered_text_sim.T, device)
+        # Build soft labels from gathered similarity matrix
+        # Both image->text and text->image use the same text similarity matrix
+        # because image_i corresponds to text_i (text_sim serves as proxy for image_sim)
+        soft_labels_image = self.build_soft_labels(gathered_text_sim, device, num_logits)
+        soft_labels_text = self.build_soft_labels(gathered_text_sim, device, num_logits)
+
+        # Compute soft cross-entropy loss
+        loss_image = self.soft_cross_entropy(logits_per_image, soft_labels_image)
+        loss_text = self.soft_cross_entropy(logits_per_text, soft_labels_text)
+
+        total_loss = (loss_image + loss_text) / 2
+
+        return {"contrastive_loss": total_loss} if output_dict else total_loss
+
+
+class LearnableSoftClipLoss(nn.Module):
+    """
+    可学习软标签对比学习损失
+
+    与 SoftClipLoss 的区别：
+    1. 阈值和权重不再是固定超参数，而是从外部传入的可学习参数
+    2. 相似度矩阵从外部传入，支持混合可学习相似度
+
+    Args:
+        local_loss: Whether to use local loss
+        gather_with_grad: Whether to gather features with gradient
+        rank: Current GPU rank
+        world_size: Total number of GPUs
+        use_horovod: Whether to use Horovod
+    """
+
+    def __init__(
+            self,
+            local_loss=True,
+            gather_with_grad=True,
+            rank=0,
+            world_size=1,
+            use_horovod=False,
+    ):
+        super().__init__()
+        self.local_loss = local_loss
+        self.gather_with_grad = gather_with_grad
+        self.rank = rank
+        self.world_size = world_size
+        self.use_horovod = use_horovod
+
+    def build_soft_labels(self, sim_matrix, threshold, soft_weight, device, num_logits):
+        """
+        使用外部传入的可学习参数构建软标签（可微分版本）
+
+        Args:
+            sim_matrix: [num_queries, num_classes] 相似度矩阵（可以是混合后的）
+            threshold: 可学习阈值参数 (nn.Parameter)
+            soft_weight: 可学习权重参数 (nn.Parameter)
+            device: target device
+            num_logits: local batch size
+
+        Returns:
+            soft_labels: same shape as sim_matrix (可微分)
+        """
+        num_queries, num_classes = sim_matrix.shape
+
+        # 对参数应用 sigmoid 确保在合理范围
+        threshold_val = torch.sigmoid(threshold)  # [0, 1]
+        soft_weight_val = torch.sigmoid(soft_weight)  # [0, 1]
+
+        # 创建硬正样本的 one-hot 标签
+        row_indices = torch.arange(num_queries, device=device)
+        if self.world_size > 1 and self.local_loss:
+            col_indices = row_indices + num_logits * self.rank
+        else:
+            col_indices = row_indices
+
+        # Clamp col_indices to valid range
+        col_indices = torch.clamp(col_indices, 0, num_classes - 1)
+
+        # 创建硬正样本掩码 (不可微，但只用于标记位置)
+        hard_positive_mask = torch.zeros(num_queries, num_classes, device=device)
+        hard_positive_mask[row_indices, col_indices] = 1.0
+
+        # 使用可微的方式计算软正样本权重
+        # soft_gate: 当 sim > threshold 时趋近于 1，否则趋近于 0
+        # 使用 sigmoid 平滑过渡，temperature 控制平滑程度
+        temperature = 10.0  # 控制 sigmoid 的陡峭程度
+        soft_gate = torch.sigmoid(temperature * (sim_matrix - threshold_val))
+
+        # 软正样本的权重 = soft_gate * soft_weight_val * sim_matrix
+        # 排除硬正样本位置 (1 - hard_positive_mask)
+        soft_positive_weights = soft_gate * soft_weight_val * sim_matrix * (1 - hard_positive_mask)
+
+        # 最终软标签 = 硬正样本(权重1.0) + 软正样本(可微权重)
+        soft_labels = hard_positive_mask + soft_positive_weights
+
+        return soft_labels
+
+    def gather_sim_matrix(self, sim_matrix):
+        """
+        Gather similarity matrix from all GPUs.
+        """
+        if self.world_size == 1:
+            return sim_matrix
+
+        assert has_distributed, 'torch.distributed did not import correctly'
+
+        # Gather along column dimension
+        gathered_sim = [torch.zeros_like(sim_matrix) for _ in range(self.world_size)]
+        dist.all_gather(gathered_sim, sim_matrix)
+
+        # Concatenate along column dimension: [local_batch, global_batch]
+        all_sim = torch.cat(gathered_sim, dim=1)
+
+        # If global loss, also gather along row dimension
+        if not self.local_loss:
+            gathered_rows = [torch.zeros_like(all_sim) for _ in range(self.world_size)]
+            dist.all_gather(gathered_rows, all_sim)
+            all_sim = torch.cat(gathered_rows, dim=0)
+
+        return all_sim
+
+    def get_logits(self, image_features, text_features, logit_scale):
+        """Compute logits with multi-GPU gathering."""
+        if self.world_size > 1:
+            all_image_features, all_text_features = gather_features(
+                image_features,
+                text_features,
+                local_loss=self.local_loss,
+                gather_with_grad=self.gather_with_grad,
+                rank=self.rank,
+                world_size=self.world_size,
+                use_horovod=self.use_horovod,
+            )
+
+            if self.local_loss:
+                logits_per_image = logit_scale * image_features @ all_text_features.T
+                logits_per_text = logit_scale * text_features @ all_image_features.T
+            else:
+                logits_per_image = logit_scale * all_image_features @ all_text_features.T
+                logits_per_text = logits_per_image.T
+        else:
+            logits_per_image = logit_scale * image_features @ text_features.T
+            logits_per_text = logit_scale * text_features @ image_features.T
+
+        return logits_per_image, logits_per_text
+
+    def soft_cross_entropy(self, logits, soft_labels):
+        """
+        Compute soft cross-entropy loss.
+        """
+        log_probs = F.log_softmax(logits, dim=1)
+        soft_targets = soft_labels / soft_labels.sum(dim=1, keepdim=True)
+        loss = -(soft_targets * log_probs).sum(dim=1).mean()
+        return loss
+
+    def forward(self, image_features, text_features, logit_scale,
+                sim_matrix, threshold, soft_weight, output_dict=False):
+        """
+        Forward pass for learnable soft-label contrastive learning.
+
+        Args:
+            image_features: ECG features [local_batch, embed_dim]
+            text_features: Text features [local_batch, embed_dim]
+            logit_scale: Temperature parameter
+            sim_matrix: 混合相似度矩阵，已经是 [local_batch, global_batch] 形状
+                        (在 compute_hybrid_similarity 中已完成 gather)
+            threshold: 可学习阈值参数 (nn.Parameter)
+            soft_weight: 可学习软正样本权重 (nn.Parameter)
+            output_dict: Whether to return dict or scalar
+
+        Returns:
+            loss or {"contrastive_loss": loss}
+        """
+        device = image_features.device
+
+        # Get logits
+        logits_per_image, logits_per_text = self.get_logits(image_features, text_features, logit_scale)
+
+        num_logits = logits_per_image.shape[0]
+
+        # sim_matrix 已经在 compute_hybrid_similarity 中完成了 gather
+        # 形状为 [local_batch, global_batch]，可以直接使用
+
+        # Build soft labels using learnable parameters
+        soft_labels_image = self.build_soft_labels(sim_matrix, threshold, soft_weight, device, num_logits)
+        soft_labels_text = self.build_soft_labels(sim_matrix, threshold, soft_weight, device, num_logits)
 
         # Compute soft cross-entropy loss
         loss_image = self.soft_cross_entropy(logits_per_image, soft_labels_image)

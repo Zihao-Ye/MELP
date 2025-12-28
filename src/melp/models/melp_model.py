@@ -22,7 +22,7 @@ from melp.backbone.transformer import  (
     QuickGELU,
     MultimodalTransformer,
 )
-from melp.utils.openclip_loss import CoCaLoss
+from melp.utils.openclip_loss import CoCaLoss, LearnableSoftClipLoss
 from melp.models.ecgfm_model import ECGFMModel
 from melp.backbone.transformer import AttentionalPooler
 from melp.backbone.resnet1d import ResNet18, ResNet34, ResNet50, ResNet101
@@ -449,16 +449,31 @@ class MELPModel(MERLModel):
         if normalize:
             proj_text_emb = F.normalize(proj_text_emb, dim=-1)
 
+        # ========== 原有返回 (已注释) ==========
+        # if return_sent_emb:
+        #     return proj_text_emb, token_emb, sent_emb
+        # else:
+        #     return proj_text_emb, token_emb
+
+        # ========== 新增: 返回 text_emb 用于计算可学习相似度 ==========
         if return_sent_emb:
-            return proj_text_emb, token_emb, sent_emb
+            return proj_text_emb, token_emb, sent_emb, text_emb
         else:
-            return proj_text_emb, token_emb
+            return proj_text_emb, token_emb, text_emb
     
     def encode_text(self, input_ids, attention_mask, normalize: bool = True, return_sent_emb: bool = True):
+        # ========== 原有逻辑 (已注释) ==========
+        # if return_sent_emb:
+        #     text_latent, _, _ = self._encode_text(input_ids, attention_mask, normalize=normalize, return_sent_emb=True)
+        # else:
+        #     text_latent, _ = self._encode_text(input_ids, attention_mask, normalize=normalize, return_sent_emb=False)
+        # return text_latent
+
+        # ========== 新增: 适配 _encode_text 返回 text_emb ==========
         if return_sent_emb:
-            text_latent, _, _ = self._encode_text(input_ids, attention_mask, normalize=normalize, return_sent_emb=True)
+            text_latent, _, _, _ = self._encode_text(input_ids, attention_mask, normalize=normalize, return_sent_emb=True)
         else:
-            text_latent, _ = self._encode_text(input_ids, attention_mask, normalize=normalize, return_sent_emb=False)
+            text_latent, _, _ = self._encode_text(input_ids, attention_mask, normalize=normalize, return_sent_emb=False)
         return text_latent
 
     @torch.no_grad()
@@ -470,10 +485,16 @@ class MELPModel(MERLModel):
         
     @torch.no_grad()
     def get_text_emb(self, input_ids, attention_mask):
-        if self.text_encoder_name in ["ncbi/MedCPT-Query-Encoder", "*/heart_bert"]:
-            text_output = self.lm_model(input_ids=input_ids, attention_mask=attention_mask)
-            # using the CLS token as the global embedding
-            text_emb = text_output.last_hidden_state[:, -1]
+        if self.text_encoder_name in ["ncbi/MedCPT-Query-Encoder", "fuyingw/heart_bert"]:
+            # ========== 原有代码 (已注释，有 bug) ==========
+            # text_output = self.lm_model(input_ids=input_ids, attention_mask=attention_mask)
+            # # using the CLS token as the global embedding
+            # text_emb = text_output.last_hidden_state[:, -1]
+
+            # ========== 修复: 与 _encode_text 保持一致 ==========
+            text_output = self.lm_model(input_ids=input_ids, attention_mask=attention_mask, output_hidden_states=True)
+            last_hidden_state = text_output.hidden_states[-1]
+            text_emb = last_hidden_state[:, -1]
         else:
             raise NotImplementedError
 
@@ -496,7 +517,7 @@ class MELPModel(MERLModel):
 
         input_ids = text
         attention_mask = (input_ids != self.tokenizer.pad_token_type_id).long()
-        text_latent, token_embs = self._encode_text(input_ids, attention_mask, return_sent_emb=False)
+        text_latent, token_embs, _ = self._encode_text(input_ids, attention_mask, return_sent_emb=False)
 
         if output_labels:
             # align text_embs and thus logits with labels for teacher-forcing caption loss
@@ -535,7 +556,11 @@ class MELPModel(MERLModel):
             text_output = self._tokenize(text)
             input_ids = text_output.input_ids.type_as(ecg).long()
             attention_mask = text_output.attention_mask.type_as(ecg).long()
-        text_latent, token_embs, sent_embs = self._encode_text(input_ids, attention_mask)
+        # ========== 原有调用 (已注释) ==========
+        # text_latent, token_embs, sent_embs = self._encode_text(input_ids, attention_mask)
+
+        # ========== 新增: 获取 text_emb 用于计算可学习相似度 ==========
+        text_latent, token_embs, sent_embs, text_emb = self._encode_text(input_ids, attention_mask)
 
         if output_labels:
             # align text_embs and thus logits with labels for teacher-forcing caption loss
@@ -549,9 +574,21 @@ class MELPModel(MERLModel):
         logits = self.text_decoder(ecg_embs, token_embs)
 
         sent_embs = [self.sent_proj(sent_emb) for sent_emb in sent_embs]
+        # ========== 原有 out_dict (已注释) ==========
+        # out_dict = {
+        #     "ecg_latent": ecg_latent,
+        #     "text_latent": text_latent,
+        #     "logits": logits,
+        #     "logit_scale": self.logit_scale.exp(),
+        #     "ecg_embs": ecg_beat_embs,
+        #     "sent_embs": sent_embs
+        # }
+
+        # ========== 新增: 添加 text_emb 用于计算可学习相似度 ==========
         out_dict = {
             "ecg_latent": ecg_latent,
             "text_latent": text_latent,
+            "text_emb": text_emb,  # 原始 LM 嵌入，用于计算固定相似度
             "logits": logits,
             "logit_scale": self.logit_scale.exp(),
             "ecg_embs": ecg_beat_embs,
@@ -577,25 +614,78 @@ class MELPModel(MERLModel):
         uot_loss, _ = self.uot_loss(output_dict["ecg_embs"], output_dict["sent_embs"])
         uot_loss *= self.local_loss_weight
 
-        coca_loss = CoCaLoss(
-            caption_loss_weight=self.caption_loss_weight,
-            clip_loss_weight=self.clip_loss_weight,
-            pad_id= self.tokenizer.pad_token_type_id,
-            local_loss=True,
-            gather_with_grad=True,
-            cache_labels=True,
-            rank=torch.distributed.get_rank(),
-            world_size=torch.distributed.get_world_size(),
-            use_horovod=False
-        )
+        # ========== 原有 CoCaLoss 调用 (已注释) ==========
+        # coca_loss = CoCaLoss(
+        #     caption_loss_weight=self.caption_loss_weight,
+        #     clip_loss_weight=self.clip_loss_weight,
+        #     pad_id= self.tokenizer.pad_token_type_id,
+        #     local_loss=True,
+        #     gather_with_grad=True,
+        #     cache_labels=True,
+        #     rank=torch.distributed.get_rank(),
+        #     world_size=torch.distributed.get_world_size(),
+        #     use_horovod=False
+        # )
 
-        cma_loss, caption_loss = coca_loss(
-            image_features=output_dict["ecg_latent"],
-            text_features=output_dict["text_latent"],
-            logits=output_dict["logits"],
-            labels=output_dict["labels"],
-            logit_scale=output_dict["logit_scale"]
+        # cma_loss, caption_loss = coca_loss(
+        #     image_features=output_dict["ecg_latent"],
+        #     text_features=output_dict["text_latent"],
+        #     logits=output_dict["logits"],
+        #     labels=output_dict["labels"],
+        #     logit_scale=output_dict["logit_scale"]
+        # )
+
+        # ========== 新增: 可学习软标签 CMA Loss ==========
+        if self.use_learnable_sim:
+            # 计算混合相似度矩阵
+            hybrid_sim, alpha = self.compute_hybrid_similarity(
+                output_dict["text_latent"],  # proj_text_emb (可学习)
+                output_dict["text_emb"]       # 原始 LM 嵌入 (固定)
+            )
+
+            # 软标签 CMA loss
+            soft_cma_loss_fn = LearnableSoftClipLoss(
+                local_loss=True,
+                gather_with_grad=True,
+                rank=torch.distributed.get_rank(),
+                world_size=torch.distributed.get_world_size(),
+                use_horovod=False
+            )
+
+            cma_loss = soft_cma_loss_fn(
+                image_features=output_dict["ecg_latent"],
+                text_features=output_dict["text_latent"],
+                logit_scale=output_dict["logit_scale"],
+                sim_matrix=hybrid_sim,
+                threshold=self.learnable_threshold,
+                soft_weight=self.learnable_soft_weight,
+            )
+            cma_loss = cma_loss * self.clip_loss_weight
+        else:
+            # 原有 CoCaLoss 的 CMA 部分 (硬标签)
+            from melp.utils.openclip_loss import ClipLoss
+            clip_loss_fn = ClipLoss(
+                local_loss=True,
+                gather_with_grad=True,
+                cache_labels=True,
+                rank=torch.distributed.get_rank(),
+                world_size=torch.distributed.get_world_size(),
+                use_horovod=False
+            )
+            cma_loss = clip_loss_fn(
+                output_dict["ecg_latent"],
+                output_dict["text_latent"],
+                output_dict["logit_scale"]
+            )
+            cma_loss = cma_loss * self.clip_loss_weight
+
+        # Caption loss (保持不变)
+        caption_loss_fn = nn.CrossEntropyLoss(ignore_index=self.tokenizer.pad_token_type_id)
+        caption_loss = caption_loss_fn(
+            output_dict["logits"].permute(0, 2, 1),
+            output_dict["labels"]
         )
+        caption_loss = caption_loss * self.caption_loss_weight
 
         # cma_loss = torch.tensor(0.0).type_as(caption_loss)
         # uot_loss = torch.tensor(0.0).type_as(caption_loss)
@@ -606,6 +696,12 @@ class MELPModel(MERLModel):
             "caption_loss": caption_loss,
             "uot_loss": uot_loss
         }
+
+        # 记录可学习参数的当前值 (用于监控训练过程)
+        if self.use_learnable_sim:
+            loss_dict['sim_alpha'] = alpha.detach()
+            loss_dict['threshold'] = torch.sigmoid(self.learnable_threshold).detach()
+            loss_dict['soft_weight'] = torch.sigmoid(self.learnable_soft_weight).detach()
 
         if torch.isnan(loss_dict["loss"]):
             ipdb.set_trace()

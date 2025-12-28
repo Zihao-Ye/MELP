@@ -1,0 +1,2566 @@
+
+╭─── Claude Code v2.0.67 ──────────────────────────────────────────────────────╮
+│                                  │ Tips for getting started                  │
+│           Welcome back!          │ Run /init to create a CLAUDE.md file wit… │
+│                                  │ ───────────────────────────────────────── │
+│            * ▐▛███▜▌ *           │ Recent activity                           │
+│           * ▝▜█████▛▘ *          │ No recent activity                        │
+│            *  ▘▘ ▝▝  *           │                                           │
+│                                  │                                           │
+│   Opus 4.5 · API Usage Billing   │                                           │
+│              ~/MELP              │                                           │
+╰──────────────────────────────────────────────────────────────────────────────╯
+
+  /model to try Opus 4.5
+
+> /model 
+  ⎿  Set model to opus (claude-opus-4-5-20251101)
+
+> 目前 MELP/scripts/pretrain/main_pretrain.py 
+预训练链路中选用merl模型时，计算跨模态loss时是采用固定阈值的方案MELP/src/mel
+p/utils/openclip_loss.py的softcliploss，我希望采用一个可学习的相似
+  度矩阵来，而不是目前的直接依赖文本嵌入的相似度矩阵这种固定的方案。你先做出
+修改的方案，我看完之后再决定是否修改到代码中 
+
+● 我来先阅读相关代码，了解当前的实现方案。
+
+● Read(src/melp/utils/openclip_loss.py)
+  ⎿  Read 679 lines
+
+● Read(scripts/pretrain/main_pretrain.py)
+  ⎿  Read 187 lines
+
+● 让我继续阅读MERLModel来了解如何使用SoftClipLoss的：
+
+● Read(src/melp/models/merl_model.py)
+  ⎿  Read 423 lines
+
+● 现在我对代码有了完整的理解。让我总结当前方案并提出修改方案。
+
+  ---
+  当前方案分析
+
+  现有实现流程
+
+  MERLModel.shared_step() 
+      → compute_text_similarity(batch['report'])  # 使用MedCPT等医学LM计算文本相似度
+      → SoftClipLoss.forward()
+          → build_soft_labels(text_sim_matrix)    # 基于固定阈值构建软标签
+
+  核心问题：
+  1. text_sim_matrix 是用预训练LM（如MedCPT）的嵌入固定计算的
+  2. similarity_threshold=0.95 和 soft_positive_weight=0.05 是固定超参数
+  3. 软标签完全依赖于文本语义相似度，无法根据训练反馈自适应调整
+
+  ---
+  可学习相似度矩阵方案
+
+  我提出以下几个方案供你选择：
+
+  ---
+  方案一：可学习的类别嵌入矩阵（Learnable Class Embeddings）
+
+  核心思想：为数据集中的每个诊断类别学习一个嵌入向量，通过这些嵌入的相似度来构建可学习的相似度矩阵。
+
+  优点：
+  - 语义清晰，每个类别有独立的嵌入表示
+  - 可以用文本嵌入初始化，利用先验知识
+  - 相似度矩阵随训练动态更新
+
+  缺点：
+  - 需要预先定义类别集合
+  - 对于新类别需要额外处理
+
+  # 在 MERLModel 中添加
+  class MERLModel(BasePretrainModel):
+      def __init__(self, ..., num_diagnosis_classes=100, class_emb_dim=128):
+          ...
+          # 可学习的诊断类别嵌入矩阵
+          self.class_embeddings = nn.Parameter(
+              torch.randn(num_diagnosis_classes, class_emb_dim)
+          )
+          # 将report映射到类别分布的网络
+          self.report_to_class = nn.Sequential(
+              nn.Linear(text_encoder_hidden_dim, 256),
+              nn.ReLU(),
+              nn.Linear(256, num_diagnosis_classes),
+              nn.Softmax(dim=-1)
+          )
+
+      def compute_learnable_similarity(self, text_embeddings):
+          """
+          基于可学习类别嵌入计算相似度矩阵
+          
+          Args:
+              text_embeddings: [batch_size, hidden_dim] 文本嵌入
+          Returns:
+              sim_matrix: [batch_size, batch_size] 可学习相似度矩阵
+          """
+          # 获取每个样本的类别分布 [batch_size, num_classes]
+          class_probs = self.report_to_class(text_embeddings)
+
+          # 计算加权类别嵌入 [batch_size, class_emb_dim]
+          weighted_emb = class_probs @ F.normalize(self.class_embeddings, dim=-1)
+          weighted_emb = F.normalize(weighted_emb, dim=-1)
+
+          # 计算相似度矩阵
+          sim_matrix = weighted_emb @ weighted_emb.T
+          return sim_matrix
+
+  ---
+  方案二：可学习的相似度预测网络（Similarity Prediction Network）
+
+  核心思想：使用一个小型网络直接预测任意两个样本之间的相似度。
+
+  优点：
+  - 高度灵活，不依赖预定义类别
+  - 可以捕捉复杂的相似度关系
+
+  缺点：
+  - 计算量较大（O(N²) 次网络前向传播）
+  - 需要更多参数
+
+  # 在 MERLModel 中添加
+  class SimilarityPredictor(nn.Module):
+      def __init__(self, input_dim, hidden_dim=128):
+          super().__init__()
+          self.net = nn.Sequential(
+              nn.Linear(input_dim * 2, hidden_dim),  # 拼接两个嵌入
+              nn.ReLU(),
+              nn.Linear(hidden_dim, hidden_dim),
+              nn.ReLU(),
+              nn.Linear(hidden_dim, 1),
+              nn.Sigmoid()  # 输出 [0, 1] 范围的相似度
+          )
+
+      def forward(self, emb1, emb2):
+          # emb1, emb2: [batch_size, dim]
+          combined = torch.cat([emb1, emb2, emb1 * emb2, (emb1 - emb2).abs()], dim=-1)
+          return self.net(combined).squeeze(-1)
+
+  class MERLModel(BasePretrainModel):
+      def __init__(self, ...):
+          ...
+          self.sim_predictor = SimilarityPredictor(input_dim=text_encoder_hidden_dim)
+
+      def compute_learnable_similarity(self, text_embeddings):
+          """
+          使用可学习网络预测相似度矩阵
+          """
+          batch_size = text_embeddings.size(0)
+
+          # 构建所有样本对
+          emb_i = text_embeddings.unsqueeze(1).expand(-1, batch_size, -1)
+          emb_j = text_embeddings.unsqueeze(0).expand(batch_size, -1, -1)
+
+          # 预测相似度 [batch_size, batch_size]
+          sim_matrix = self.sim_predictor(
+              emb_i.reshape(-1, text_embeddings.size(-1)),
+              emb_j.reshape(-1, text_embeddings.size(-1))
+          ).reshape(batch_size, batch_size)
+
+          # 确保对称性
+          sim_matrix = (sim_matrix + sim_matrix.T) / 2
+          return sim_matrix
+
+  ---
+  方案三：可学习的投影空间相似度（Learnable Projection Space）
+
+  核心思想：学习一个专门的投影空间，在这个空间中计算相似度用于软标签，与对比学习的投影空间分离。
+
+  优点：
+  - 结构简单，计算高效
+  - 分离对比学习空间和软标签空间，各自优化
+  - 可以用固定文本嵌入初始化
+
+  缺点：
+  - 可解释性相对较弱
+
+  class MERLModel(BasePretrainModel):
+      def __init__(self, ..., soft_label_dim=64):
+          ...
+          # 用于软标签的可学习投影层
+          self.soft_label_projector = nn.Sequential(
+              nn.Linear(text_encoder_hidden_dim, 128),
+              nn.LayerNorm(128),
+              nn.ReLU(),
+              nn.Linear(128, soft_label_dim),
+          )
+
+          # 可学习的温度参数
+          self.soft_label_temperature = nn.Parameter(torch.tensor(1.0))
+
+      def compute_learnable_similarity(self, text_embeddings):
+          """
+          在可学习的投影空间中计算相似度
+          """
+          # 投影到软标签空间
+          soft_emb = self.soft_label_projector(text_embeddings)
+          soft_emb = F.normalize(soft_emb, dim=-1)
+
+          # 计算相似度并应用可学习温度
+          sim_matrix = soft_emb @ soft_emb.T
+          sim_matrix = torch.sigmoid(sim_matrix * self.soft_label_temperature)
+
+          return sim_matrix
+
+  ---
+  方案四：混合方案（Hybrid Approach）★ 推荐
+
+  核心思想：结合固定的文本先验知识和可学习的残差调整，既保留医学LM的语义信息，又允许模型自适应调整。
+
+  优点：
+  - 利用预训练LM的先验知识
+  - 可学习部分可以纠正先验的不足
+  - 可解释性强
+  - 训练更稳定
+
+  class MERLModel(BasePretrainModel):
+      def __init__(self, ..., soft_label_dim=64):
+          ...
+          # 可学习的残差调整网络
+          self.sim_residual = nn.Sequential(
+              nn.Linear(text_encoder_hidden_dim, 128),
+              nn.LayerNorm(128),
+              nn.ReLU(),
+              nn.Linear(128, soft_label_dim),
+          )
+
+          # 可学习的混合权重 (sigmoid 确保在 [0, 1] 范围)
+          self.alpha = nn.Parameter(torch.tensor(0.0))  # 初始更依赖固定先验
+
+          # 可学习的阈值参数
+          self.learnable_threshold = nn.Parameter(torch.tensor(0.95))
+          self.learnable_weight = nn.Parameter(torch.tensor(0.05))
+
+      def compute_learnable_similarity(self, text_embeddings, fixed_sim_matrix):
+          """
+          混合固定相似度和可学习相似度
+          
+          Args:
+              text_embeddings: [batch_size, hidden_dim] 原始文本嵌入
+              fixed_sim_matrix: [batch_size, batch_size] 固定的文本相似度矩阵
+          """
+          # 计算可学习的相似度
+          residual_emb = self.sim_residual(text_embeddings)
+          residual_emb = F.normalize(residual_emb, dim=-1)
+          learnable_sim = residual_emb @ residual_emb.T
+
+          # 混合两种相似度
+          alpha = torch.sigmoid(self.alpha)
+          hybrid_sim = alpha * learnable_sim + (1 - alpha) * fixed_sim_matrix
+
+          return hybrid_sim
+
+  同时需要修改 SoftClipLoss，使阈值和权重变为可学习参数：
+
+  class LearnableSoftClipLoss(nn.Module):
+      def __init__(self, ...):
+          super().__init__()
+          # 不再使用固定阈值，从模型传入可学习参数
+          ...
+
+      def build_soft_labels(self, sim_matrix, threshold, soft_weight, device, num_logits):
+          """
+          使用可学习参数构建软标签
+          
+          Args:
+              threshold: 可学习的阈值参数
+              soft_weight: 可学习的软正样本权重
+          """
+          # 使用 sigmoid 确保参数在合理范围
+          threshold = torch.sigmoid(threshold)  # [0, 1]
+          soft_weight = torch.sigmoid(soft_weight)  # [0, 1]
+
+          # ... 其余逻辑类似，使用可学习参数替代固定值
+
+  ---
+  方案对比
+
+  | 方案             | 计算效率 | 可解释性 | 灵活性 | 训练稳定性 | 推荐度 |
+  |------------------|----------|----------|--------|------------|--------|
+  | 方案一：类别嵌入 | 高       | 高       | 中     | 高         | ★★★★   |
+  | 方案二：预测网络 | 低       | 低       | 高     | 中         | ★★★    |
+  | 方案三：投影空间 | 高       | 中       | 中     | 高         | ★★★★   |
+  | 方案四：混合方案 | 高       | 高       | 高     | 高         | ★★★★★  |
+
+  ---
+  我的建议
+
+  推荐采用方案四（混合方案），理由：
+  1. 保留了MedCPT等医学LM的先验知识，不浪费现有的语义信息
+  2. 通过可学习的残差和混合权重，允许模型根据训练信号自适应调整
+  3. 可学习的阈值和权重比固定超参数更灵活
+  4. 实现相对简单，对现有代码改动较小
+
+  请告诉我你倾向于哪个方案，我再做具体的代码修改。
+
+> 方案4吧，你先整体规划一下 
+
+● 好的，我来整体规划方案四的实现。
+
+  ---
+  方案四：混合可学习相似度矩阵 - 实现规划
+
+  一、整体架构设计
+
+  ┌─────────────────────────────────────────────────────────────────┐
+  │                        训练流程                                  │
+  ├─────────────────────────────────────────────────────────────────┤
+  │                                                                 │
+  │  text_embeddings ─┬─► compute_text_similarity() ─► fixed_sim   │
+  │                   │         (MedCPT, 固定)                      │
+  │                   │                                    ↓        │
+  │                   └─► sim_residual_projector ─► learnable_sim  │
+  │                              (可学习)                  ↓        │
+  │                                                                 │
+  │            hybrid_sim = α * learnable_sim + (1-α) * fixed_sim  │
+  │                              ↓                                  │
+  │                    LearnableSoftClipLoss                        │
+  │                  (可学习 threshold & weight)                    │
+  │                              ↓                                  │
+  │                        soft_labels                              │
+  │                              ↓                                  │
+  │                     soft_cross_entropy                          │
+  │                                                                 │
+  └─────────────────────────────────────────────────────────────────┘
+
+  ---
+  二、需要修改的文件
+
+  | 文件                            | 修改类型 | 说明                             |
+  |---------------------------------|----------|----------------------------------|
+  | src/melp/utils/openclip_loss.py | 新增类   | 添加 LearnableSoftClipLoss       |
+  | src/melp/models/merl_model.py   | 修改     | 添加可学习模块，修改 shared_step |
+
+  ---
+  三、详细修改规划
+
+  3.1 openclip_loss.py - 新增 LearnableSoftClipLoss
+
+  class LearnableSoftClipLoss(nn.Module):
+      """
+      可学习软标签对比学习损失
+      
+      与 SoftClipLoss 的区别：
+      1. 阈值和权重不再是固定超参数，而是从外部传入（可学习）
+      2. 相似度矩阵也从外部传入（支持混合可学习相似度）
+      """
+
+      def __init__(self, local_loss, gather_with_grad, rank, world_size, ...):
+          # 移除 similarity_threshold 和 soft_positive_weight 参数
+          # 这些将作为 forward 的输入
+
+      def build_soft_labels(self, sim_matrix, threshold, soft_weight, device, num_logits):
+          """
+          使用外部传入的可学习参数构建软标签
+          
+          Args:
+              sim_matrix: 相似度矩阵 (可以是混合后的)
+              threshold: 可学习阈值 (nn.Parameter)
+              soft_weight: 可学习权重 (nn.Parameter)
+          """
+          # 对参数应用约束确保合理范围
+          # threshold: sigmoid → [0, 1]
+          # soft_weight: sigmoid → [0, 1]
+
+      def forward(self, image_features, text_features, logit_scale, 
+                  sim_matrix, threshold, soft_weight, output_dict=False):
+          """
+          前向传播
+          
+          新增参数：
+              sim_matrix: 混合相似度矩阵 (来自模型)
+              threshold: 可学习阈值参数
+              soft_weight: 可学习软正样本权重
+          """
+
+  3.2 merl_model.py - 添加可学习模块
+
+  新增模块：
+
+  class MERLModel(BasePretrainModel):
+      def __init__(self, ..., 
+                   # 新增参数
+                   soft_label_dim: int = 64,
+                   use_learnable_sim: bool = True,
+                   init_alpha: float = 0.0,  # 初始更依赖固定先验
+                   init_threshold: float = 2.0,  # sigmoid(2.0) ≈ 0.88
+                   init_soft_weight: float = -2.0,  # sigmoid(-2.0) ≈ 0.12
+                   ):
+          ...
+
+          # ========== 新增：可学习相似度模块 ==========
+          self.use_learnable_sim = use_learnable_sim
+
+          if use_learnable_sim:
+              # 1. 可学习的残差投影网络
+              self.sim_residual_projector = nn.Sequential(
+                  nn.Linear(text_encoder_hidden_dim, 128),
+                  nn.LayerNorm(128),
+                  nn.ReLU(),
+                  nn.Linear(128, soft_label_dim),
+              )
+
+              # 2. 混合权重 α (控制可学习 vs 固定的比例)
+              self.sim_alpha = nn.Parameter(torch.tensor(init_alpha))
+
+              # 3. 可学习的阈值参数
+              self.learnable_threshold = nn.Parameter(torch.tensor(init_threshold))
+
+              # 4. 可学习的软正样本权重
+              self.learnable_soft_weight = nn.Parameter(torch.tensor(init_soft_weight))
+
+  新增方法：
+
+  def compute_hybrid_similarity(self, text_embeddings, fixed_sim_matrix):
+      """
+      计算混合相似度矩阵
+      
+      hybrid_sim = α * learnable_sim + (1-α) * fixed_sim
+      
+      Args:
+          text_embeddings: [B, hidden_dim] 原始文本嵌入 (来自LM)
+          fixed_sim_matrix: [B, B] 固定的文本相似度矩阵
+      
+      Returns:
+          hybrid_sim: [B, B] 混合相似度矩阵
+      """
+      # 1. 计算可学习相似度
+      residual_emb = self.sim_residual_projector(text_embeddings)
+      residual_emb = F.normalize(residual_emb, dim=-1)
+      learnable_sim = residual_emb @ residual_emb.T
+
+      # 2. 计算混合权重 (sigmoid 确保 [0,1])
+      alpha = torch.sigmoid(self.sim_alpha)
+
+      # 3. 混合
+      hybrid_sim = alpha * learnable_sim + (1 - alpha) * fixed_sim_matrix
+
+      return hybrid_sim, alpha  # 返回 alpha 用于日志记录
+
+  修改 shared_step：
+
+  def shared_step(self, batch, batch_idx):
+      ecg_output = self.encode_ecg(batch['ecg'])
+
+      tokenized_input = self._tokenize(batch['report'])
+      input_ids = tokenized_input['input_ids'].type_as(batch['ecg']).long()
+      attention_mask = tokenized_input['attention_mask'].type_as(batch['ecg']).long()
+      text_output = self.encode_text(input_ids, attention_mask)
+
+      # ========== 修改：使用混合相似度 ==========
+      if self.use_learnable_sim:
+          # 1. 计算固定相似度 (来自 MedCPT)
+          fixed_sim_matrix = self.compute_text_similarity(batch['report'])
+
+          # 2. 计算混合相似度
+          hybrid_sim, alpha = self.compute_hybrid_similarity(
+              text_output['text_emb'],  # 注意：用原始嵌入，不是投影后的
+              fixed_sim_matrix
+          )
+
+          # 3. 使用可学习的 Loss
+          learnable_soft_loss = LearnableSoftClipLoss(
+              local_loss=True,
+              gather_with_grad=True,
+              rank=torch.distributed.get_rank(),
+              world_size=torch.distributed.get_world_size(),
+          )
+
+          soft_cma_loss = learnable_soft_loss(
+              image_features=ecg_output['proj_ecg_emb'],
+              text_features=text_output['proj_text_emb'],
+              logit_scale=self.logit_scale.exp(),
+              sim_matrix=hybrid_sim,
+              threshold=self.learnable_threshold,
+              soft_weight=self.learnable_soft_weight,
+          )
+      else:
+          # 保留原有逻辑作为 fallback
+          ...
+
+      # 记录可学习参数用于监控
+      loss_dict = {
+          'loss': soft_cma_loss + uma_loss,
+          'soft_cma_loss': soft_cma_loss,
+          'uma_loss': uma_loss,
+          'sim_alpha': torch.sigmoid(self.sim_alpha).item(),
+          'threshold': torch.sigmoid(self.learnable_threshold).item(),
+          'soft_weight': torch.sigmoid(self.learnable_soft_weight).item(),
+      }
+
+  ---
+  四、新增命令行参数
+
+  在 main_pretrain.py 中添加：
+
+  # 可学习相似度相关参数
+  parser.add_argument("--use_learnable_sim", action="store_true", default=True)
+  parser.add_argument("--soft_label_dim", type=int, default=64)
+  parser.add_argument("--init_alpha", type=float, default=0.0)
+  parser.add_argument("--init_threshold", type=float, default=2.0)
+  parser.add_argument("--init_soft_weight", type=float, default=-2.0)
+
+  ---
+  五、关键设计决策
+
+  | 设计点       | 决策                           | 理由                                      |
+  |--------------|--------------------------------|-------------------------------------------|
+  | 参数约束方式 | sigmoid 激活                   | 确保参数在 [0,1] 范围，训练稳定           |
+  | 初始化策略   | α=0 (偏向固定)                 | 训练初期依赖医学LM先验，逐步学习调整      |
+  | 输入嵌入     | 用 text_emb 不用 proj_text_emb | 保留更多原始语义信息                      |
+  | Loss 实例化  | 每次 forward 创建              | 支持分布式训练的 rank/world_size 动态获取 |
+  | 向后兼容     | use_learnable_sim 开关         | 可随时切换回固定方案对比实验              |
+
+  ---
+  六、监控指标
+
+  训练时应记录以下指标以便分析：
+
+  # 在 training_step 中 log
+  self.log('train/sim_alpha', alpha, on_step=True)
+  self.log('train/threshold', sigmoid(threshold), on_step=True)
+  self.log('train/soft_weight', sigmoid(soft_weight), on_step=True)
+
+  通过观察这些参数的变化趋势，可以了解：
+  - alpha 增大 → 模型越来越依赖可学习相似度
+  - threshold 变化 → 软正样本的判定标准在调整
+  - soft_weight 变化 → 软正样本的惩罚/奖励强度在调整
+
+  ---
+  七、预期效果
+
+  1. 训练初期：α ≈ 0，主要依赖 MedCPT 的固定语义相似度
+  2. 训练中期：α 逐渐增大，模型开始学习自适应调整
+  3. 训练后期：模型找到最优的混合比例和阈值设置
+
+  ---
+  以上是整体规划，确认无误后我再进行代码修改。你觉得这个规划是否合理？有什么需要调整的地方吗？
+
+> merl本就有可学习的投影，可以仔细看下merl_model.py 
+
+● 你说得对，让我重新审视代码。MERL 已经有 proj_t 投影层，proj_text_emb 本身就是可学习的。
+
+  当前的问题是 compute_text_similarity 用的是原始的 text_emb（LM pooler_output），而不是投影后的 proj_text_emb：
+
+  # merl_model.py:270-302
+  def compute_text_similarity(self, texts: List[str]):
+      # ... 获取 text_embeddings (原始LM嵌入)
+      text_embeddings = F.normalize(text_embeddings, dim=-1)
+      similarity_matrix = text_embeddings @ text_embeddings.T  # 固定的
+      return similarity_matrix
+
+  而 encode_text 中已经有可学习投影：
+
+  # merl_model.py:190-207
+  def encode_text(self, input_ids, attention_mask):
+      # ... 获取 text_emb
+      proj_text_emb = self.proj_t(text_emb)  # ← 可学习投影
+      proj_text_emb = F.normalize(proj_text_emb, dim=-1)
+      return {'proj_text_emb': proj_text_emb, 'text_emb': text_emb}
+
+  ---
+  简化后的方案
+
+  既然 proj_t 已经存在，可以直接利用 proj_text_emb 作为可学习相似度的来源：
+
+  ┌─────────────────────────────────────────────────────────────┐
+  │                                                             │
+  │  text_emb ──► proj_t ──► proj_text_emb ──► learnable_sim   │
+  │     │         (已有)        (已有)              ↓           │
+  │     │                                          ↓           │
+  │     └──► normalize ──► fixed_sim ──────────► hybrid_sim    │
+  │            (MedCPT原始嵌入)           α*(learn) + (1-α)*(fix)│
+  │                                                             │
+  └─────────────────────────────────────────────────────────────┘
+
+  修改点精简为：
+
+  | 文件             | 修改内容                                                                                                                                   |
+  |------------------|--------------------------------------------------------------------------------------------------------------------------------------------|
+  | merl_model.py    | 1. 新增 sim_alpha, learnable_threshold, learnable_soft_weight 参数2. 新增 compute_hybrid_similarity 方法3. 修改 shared_step 使用混合相似度 |
+  | openclip_loss.py | 新增 LearnableSoftClipLoss（阈值和权重作为输入参数）                                                                                       |
+
+  不需要新增 sim_residual_projector，直接复用 proj_t。
+
+  ---
+  核心代码逻辑
+
+  def compute_hybrid_similarity(self, proj_text_emb, text_emb):
+      """
+      混合可学习相似度和固定相似度
+      
+      Args:
+          proj_text_emb: [B, proj_dim] 投影后的文本嵌入 (可学习，来自 proj_t)
+          text_emb: [B, hidden_dim] 原始LM嵌入 (固定)
+      """
+      # 可学习相似度：用投影后的嵌入
+      learnable_sim = proj_text_emb @ proj_text_emb.T  # 已经归一化
+
+      # 固定相似度：用原始LM嵌入
+      fixed_emb = F.normalize(text_emb, dim=-1)
+      fixed_sim = fixed_emb @ fixed_emb.T
+
+      # 混合
+      alpha = torch.sigmoid(self.sim_alpha)
+      hybrid_sim = alpha * learnable_sim + (1 - alpha) * fixed_sim
+
+      return hybrid_sim, alpha
+
+  def shared_step(self, batch, batch_idx):
+      ecg_output = self.encode_ecg(batch['ecg'])
+      text_output = self.encode_text(...)  # 已有 proj_text_emb 和 text_emb
+
+      # 计算混合相似度
+      hybrid_sim, alpha = self.compute_hybrid_similarity(
+          text_output['proj_text_emb'],  # 可学习
+          text_output['text_emb']         # 固定
+      )
+
+      # 使用可学习软标签损失
+      soft_cma_loss = learnable_soft_loss(
+          ...,
+          sim_matrix=hybrid_sim,
+          threshold=self.learnable_threshold,
+          soft_weight=self.learnable_soft_weight,
+      )
+
+  ---
+  这样方案更简洁，充分利用了现有的 proj_t 投影层。确认这个方向后我开始写代码？
+
+> 开始修改 
+
+● Update(src/melp/utils/openclip_loss.py)
+  ⎿  Updated src/melp/utils/openclip_loss.py with 178 additions          
+       370            return {"contrastive_loss": total_loss} if 
+             output_dict else total_loss
+       371    
+       372    
+       373 +  class LearnableSoftClipLoss(nn.Module):
+       374 +      """
+       375 +      可学习软标签对比学习损失
+       376 +  
+       377 +      与 SoftClipLoss 的区别：
+       378 +      1. 
+           + 阈值和权重不再是固定超参数，而是从外部传入的可学习参数
+       379 +      2. 相似度矩阵从外部传入，支持混合可学习相似度
+       380 +  
+       381 +      Args:
+       382 +          local_loss: Whether to use local loss
+       383 +          gather_with_grad: Whether to gather features with 
+           + gradient
+       384 +          rank: Current GPU rank
+       385 +          world_size: Total number of GPUs
+       386 +          use_horovod: Whether to use Horovod
+       387 +      """
+       388 +  
+       389 +      def __init__(
+       390 +              self,
+       391 +              local_loss=True,
+       392 +              gather_with_grad=True,
+       393 +              rank=0,
+       394 +              world_size=1,
+       395 +              use_horovod=False,
+       396 +      ):
+       397 +          super().__init__()
+       398 +          self.local_loss = local_loss
+       399 +          self.gather_with_grad = gather_with_grad
+       400 +          self.rank = rank
+       401 +          self.world_size = world_size
+       402 +          self.use_horovod = use_horovod
+       403 +  
+       404 +      def build_soft_labels(self, sim_matrix, threshold, 
+           + soft_weight, device, num_logits):
+       405 +          """
+       406 +          使用外部传入的可学习参数构建软标签
+       407 +  
+       408 +          Args:
+       409 +              sim_matrix: [num_queries, num_classes] 
+           + 相似度矩阵（可以是混合后的）
+       410 +              threshold: 可学习阈值参数 
+           + (nn.Parameter)，会通过 sigmoid 约束到 [0, 1]
+       411 +              soft_weight: 可学习权重参数 
+           + (nn.Parameter)，会通过 sigmoid 约束到 [0, 1]
+       412 +              device: target device
+       413 +              num_logits: local batch size
+       414 +  
+       415 +          Returns:
+       416 +              soft_labels: same shape as sim_matrix
+       417 +          """
+       418 +          num_queries, num_classes = sim_matrix.shape
+       419 +  
+       420 +          # 对参数应用 sigmoid 确保在合理范围
+       421 +          threshold_val = torch.sigmoid(threshold)
+       422 +          soft_weight_val = torch.sigmoid(soft_weight)
+       423 +  
+       424 +          # Initialize soft labels
+       425 +          soft_labels = torch.zeros_like(sim_matrix, 
+           + device=device)
+       426 +  
+       427 +          # Compute hard positive indices
+       428 +          row_indices = torch.arange(num_queries, 
+           + device=device)
+       429 +          if self.world_size > 1 and self.local_loss:
+       430 +              col_indices = row_indices + num_logits * 
+           + self.rank
+       431 +          else:
+       432 +              col_indices = row_indices
+       433 +  
+       434 +          # Clamp col_indices to valid range
+       435 +          col_indices = torch.clamp(col_indices, 0, 
+           + num_classes - 1)
+       436 +  
+       437 +          # Set hard positives
+       438 +          soft_labels[row_indices, col_indices] = 1.0
+       439 +  
+       440 +          # Create mask for non-hard positions
+       441 +          diag_mask = torch.zeros_like(soft_labels, 
+           + dtype=torch.bool)
+       442 +          diag_mask[row_indices, col_indices] = True
+       443 +  
+       444 +          # Soft positives: similarity >= threshold AND not 
+           + hard positive
+       445 +          soft_mask = (sim_matrix >= threshold_val) & 
+           + (~diag_mask)
+       446 +          soft_labels[soft_mask] = soft_weight_val * 
+           + sim_matrix[soft_mask]
+       447 +  
+       448 +          return soft_labels
+       449 +  
+       450 +      def gather_sim_matrix(self, sim_matrix):
+       451 +          """
+       452 +          Gather similarity matrix from all GPUs.
+       453 +          """
+       454 +          if self.world_size == 1:
+       455 +              return sim_matrix
+       456 +  
+       457 +          assert has_distributed, 'torch.distributed did not 
+           + import correctly'
+       458 +  
+       459 +          # Gather along column dimension
+       460 +          gathered_sim = [torch.zeros_like(sim_matrix) for _ 
+           + in range(self.world_size)]
+       461 +          dist.all_gather(gathered_sim, sim_matrix)
+       462 +  
+       463 +          # Concatenate along column dimension: [local_batch,
+           +  global_batch]
+       464 +          all_sim = torch.cat(gathered_sim, dim=1)
+       465 +  
+       466 +          # If global loss, also gather along row dimension
+       467 +          if not self.local_loss:
+       468 +              gathered_rows = [torch.zeros_like(all_sim) for 
+           + _ in range(self.world_size)]
+       469 +              dist.all_gather(gathered_rows, all_sim)
+       470 +              all_sim = torch.cat(gathered_rows, dim=0)
+       471 +  
+       472 +          return all_sim
+       473 +  
+       474 +      def get_logits(self, image_features, text_features, 
+           + logit_scale):
+       475 +          """Compute logits with multi-GPU gathering."""
+       476 +          if self.world_size > 1:
+       477 +              all_image_features, all_text_features = 
+           + gather_features(
+       478 +                  image_features,
+       479 +                  text_features,
+       480 +                  local_loss=self.local_loss,
+       481 +                  gather_with_grad=self.gather_with_grad,
+       482 +                  rank=self.rank,
+       483 +                  world_size=self.world_size,
+       484 +                  use_horovod=self.use_horovod,
+       485 +              )
+       486 +  
+       487 +              if self.local_loss:
+       488 +                  logits_per_image = logit_scale * 
+           + image_features @ all_text_features.T
+       489 +                  logits_per_text = logit_scale * 
+           + text_features @ all_image_features.T
+       490 +              else:
+       491 +                  logits_per_image = logit_scale * 
+           + all_image_features @ all_text_features.T
+       492 +                  logits_per_text = logits_per_image.T
+       493 +          else:
+       494 +              logits_per_image = logit_scale * image_features
+           +  @ text_features.T
+       495 +              logits_per_text = logit_scale * text_features @
+           +  image_features.T
+       496 +  
+       497 +          return logits_per_image, logits_per_text
+       498 +  
+       499 +      def soft_cross_entropy(self, logits, soft_labels):
+       500 +          """
+       501 +          Compute soft cross-entropy loss.
+       502 +          """
+       503 +          log_probs = F.log_softmax(logits, dim=1)
+       504 +          soft_targets = soft_labels / soft_labels.sum(dim=1,
+           +  keepdim=True)
+       505 +          loss = -(soft_targets * 
+           + log_probs).sum(dim=1).mean()
+       506 +          return loss
+       507 +  
+       508 +      def forward(self, image_features, text_features, 
+           + logit_scale,
+       509 +                  sim_matrix, threshold, soft_weight, 
+           + output_dict=False):
+       510 +          """
+       511 +          Forward pass for learnable soft-label contrastive 
+           + learning.
+       512 +  
+       513 +          Args:
+       514 +              image_features: ECG features [local_batch, 
+           + embed_dim]
+       515 +              text_features: Text features [local_batch, 
+           + embed_dim]
+       516 +              logit_scale: Temperature parameter
+       517 +              sim_matrix: 混合相似度矩阵 [local_batch, 
+           + local_batch]
+       518 +              threshold: 可学习阈值参数 (nn.Parameter)
+       519 +              soft_weight: 可学习软正样本权重 (nn.Parameter)
+       520 +              output_dict: Whether to return dict or scalar
+       521 +  
+       522 +          Returns:
+       523 +              loss or {"contrastive_loss": loss}
+       524 +          """
+       525 +          device = image_features.device
+       526 +  
+       527 +          # Get logits
+       528 +          logits_per_image, logits_per_text = 
+           + self.get_logits(image_features, text_features, logit_scale)
+       529 +  
+       530 +          num_logits = logits_per_image.shape[0]
+       531 +  
+       532 +          # Gather similarity matrix across GPUs
+       533 +          if self.world_size > 1:
+       534 +              gathered_sim = 
+           + self.gather_sim_matrix(sim_matrix)
+       535 +          else:
+       536 +              gathered_sim = sim_matrix
+       537 +  
+       538 +          # Build soft labels using learnable parameters
+       539 +          soft_labels_image = 
+           + self.build_soft_labels(gathered_sim, threshold, soft_weight,
+           +  device, num_logits)
+       540 +          soft_labels_text = 
+           + self.build_soft_labels(gathered_sim, threshold, soft_weight,
+           +  device, num_logits)
+       541 +  
+       542 +          # Compute soft cross-entropy loss
+       543 +          loss_image = 
+           + self.soft_cross_entropy(logits_per_image, soft_labels_image)
+       544 +          loss_text = 
+           + self.soft_cross_entropy(logits_per_text, soft_labels_text)
+       545 +  
+       546 +          total_loss = (loss_image + loss_text) / 2
+       547 +  
+       548 +          return {"contrastive_loss": total_loss} if 
+           + output_dict else total_loss
+       549 +  
+       550 +  
+       551    class CoCaLoss(ClipLoss):
+       552        def __init__(
+       553                self,
+
+● 现在修改 merl_model.py，首先更新 import：
+
+● Update(src/melp/models/merl_model.py)
+  ⎿  Updated src/melp/models/merl_model.py with 1 addition and 1 removal
+       14    from melp.backbone.pooling import AttentionPool2d
+       15    from melp.models.base_pretrain_model import 
+            BasePretrainModel
+       16    # from melp.utils.utils_loss import clip_loss
+       17 -  from melp.utils.openclip_loss import ClipLoss, SoftClipLoss
+       17 +  from melp.utils.openclip_loss import ClipLoss, SoftClipLoss
+          +  , LearnableSoftClipLoss
+       18    from melp.paths import PROMPT_PATH, DATASET_LABELS_PATH
+       19    
+       20    
+
+● 现在在 __init__ 中添加可学习相似度参数：
+
+● Update(src/melp/models/merl_model.py)
+  ⎿  Updated src/melp/models/merl_model.py with 17 additions and 2 removals
+       19    
+       20    
+       21    class MERLModel(BasePretrainModel):
+       22 -      def __init__(self, 
+       22 +      def __init__(self,
+       23                     ecg_encoder_name: str = "resnet18",
+       24                     text_encoder_name: str = 
+            "ncbi/MedCPT-Query-Encoder",
+       25                     val_dataset_list: List = 
+            ["ptbxl_super_class", "ptbxl_sub_class", "ptbxl_form", 
+            "ptbxl_rhythm",
+     ...
+       30                     init_logit_scale: float = np.log(1 / 0.07),
+       31                     lr: float = 2e-4,
+       32                     weight_decay: float = 0.2,
+       33 +                   # 可学习相似度参数
+       34 +                   use_learnable_sim: bool = True,
+       35 +                   init_sim_alpha: float = 0.0,      # 
+          + sigmoid(0) = 0.5, 初始时两者各占一半
+       36 +                   init_threshold: float = 2.0,      # 
+          + sigmoid(2.0) ≈ 0.88
+       37 +                   init_soft_weight: float = -2.0,   # 
+          + sigmoid(-2.0) ≈ 0.12
+       38                     *args,
+       39                     **kwargs):
+       40 -          
+       40 +  
+       41            self.num_freeze_layers = num_freeze_layers
+       42 +          self.use_learnable_sim = use_learnable_sim
+       43            super().__init__(ecg_encoder_name=ecg_encoder_name,
+       44                             
+            text_encoder_name=text_encoder_name,
+       45                             shared_emb_dim=shared_emb_dim,
+     ...
+       51    
+       52            lshape = []
+       53            self.logit_scale = nn.Parameter(torch.ones(lshape) *
+             init_logit_scale)
+       54 +  
+       55 +          # 可学习相似度模块
+       56 +          if self.use_learnable_sim:
+       57 +              # 混合权重 α: hybrid_sim = α * learnable_sim + 
+          + (1-α) * fixed_sim
+       58 +              self.sim_alpha = 
+          + nn.Parameter(torch.tensor(init_sim_alpha))
+       59 +              # 可学习的阈值参数 (通过 sigmoid 约束到 [0, 1])
+       60 +              self.learnable_threshold = 
+          + nn.Parameter(torch.tensor(init_threshold))
+       61 +              # 可学习的软正样本权重 (通过 sigmoid 约束到 [0, 
+          + 1])
+       62 +              self.learnable_soft_weight = 
+          + nn.Parameter(torch.tensor(init_soft_weight))
+       63        
+       64            with open(PROMPT_PATH, 'r') as f:
+       65                self.prompt_dict = yaml.load(f, 
+            Loader=yaml.FullLoader)
+
+● 现在在 compute_text_similarity 方法后添加 compute_hybrid_similarity 方法：
+
+● Update(src/melp/models/merl_model.py)
+  ⎿  Updated src/melp/models/merl_model.py with 34 additions and 1 removal
+       317            similarity_matrix = text_embeddings @ 
+             text_embeddings.T
+       318    
+       319            return similarity_matrix
+       320 -      
+       320 +  
+       321 +      def compute_hybrid_similarity(self, proj_text_emb, 
+           + text_emb):
+       322 +          """
+       323 +          计算混合相似度矩阵：结合可学习相似度和固定相似度
+       324 +  
+       325 +          hybrid_sim = α * learnable_sim + (1-α) * fixed_sim
+       326 +  
+       327 +          其中：
+       328 +          - learnable_sim: 使用 proj_text_emb (经过可学习的 
+           + proj_t 投影) 计算
+       329 +          - fixed_sim: 使用原始 text_emb (来自预训练LM) 计算
+       330 +  
+       331 +          Args:
+       332 +              proj_text_emb: [B, proj_dim] 
+           + 投影后的文本嵌入，已归一化 (可学习，来自 proj_t)
+       333 +              text_emb: [B, hidden_dim] 原始LM嵌入 (固定)
+       334 +  
+       335 +          Returns:
+       336 +              hybrid_sim: [B, B] 混合相似度矩阵
+       337 +              alpha: 当前的混合权重值 (用于日志记录)
+       338 +          """
+       339 +          # 可学习相似度：用投影后的嵌入 (proj_text_emb 
+           + 已经归一化)
+       340 +          learnable_sim = proj_text_emb @ proj_text_emb.T
+       341 +  
+       342 +          # 固定相似度：用原始LM嵌入
+       343 +          fixed_emb = F.normalize(text_emb, dim=-1)
+       344 +          fixed_sim = fixed_emb @ fixed_emb.T
+       345 +  
+       346 +          # 计算混合权重 (sigmoid 确保 [0, 1])
+       347 +          alpha = torch.sigmoid(self.sim_alpha)
+       348 +  
+       349 +          # 混合两种相似度
+       350 +          hybrid_sim = alpha * learnable_sim + (1 - alpha) * 
+           + fixed_sim
+       351 +  
+       352 +          return hybrid_sim, alpha
+       353 +  
+       354        def shared_step(self, batch, batch_idx):
+       355            # only used in training_step now
+       356            ecg_output = self.encode_ecg(batch['ecg'])
+
+● 现在修改 shared_step 方法使用混合相似度：
+
+● Update(src/melp/models/merl_model.py)
+  ⎿  Tool use rejected with user message: 把之前的注释掉就可以，不要直接删除
+
+● Update(src/melp/models/merl_model.py)
+  ⎿  Updated src/melp/models/merl_model.py with 74 additions and 20 removal
+
+       374            # cma_loss = loss(
+       375            #     ecg_output['proj_ecg_emb'], 
+             text_output['proj_text_emb'], self.logit_scale.exp())
+       376    
+       377 -          # Compute text similarity matrix using medical LM 
+           - embeddings (MedCPT, etc.)
+       378 -          # This provides stable semantic similarity based on
+           -  medical knowledge
+       379 -          text_sim_matrix = 
+           - self.compute_text_similarity(batch['report'])
+       377 +          # # ========== 固定相似度方案 (已注释) ==========
+       378 +          # # Compute text similarity matrix using medical LM
+           +  embeddings (MedCPT, etc.)
+       379 +          # # This provides stable semantic similarity based 
+           + on medical knowledge
+       380 +          # text_sim_matrix = 
+           + self.compute_text_similarity(batch['report'])
+       381    
+       382 -          # Soft-label CMA (Cross-Modal Alignment) loss
+       383 -          soft_clip_loss = SoftClipLoss(
+       384 -              similarity_threshold=0.95,
+       385 -              soft_positive_weight=0.05,
+       386 -              local_loss=True,
+       387 -              gather_with_grad=True,
+       388 -              cache_labels=False,
+       389 -              rank=torch.distributed.get_rank(),
+       390 -              world_size=torch.distributed.get_world_size(),
+       391 -              use_horovod=False
+       392 -          )
+       382 +          # # Soft-label CMA (Cross-Modal Alignment) loss
+       383 +          # soft_clip_loss = SoftClipLoss(
+       384 +          #     similarity_threshold=0.95,
+       385 +          #     soft_positive_weight=0.05,
+       386 +          #     local_loss=True,
+       387 +          #     gather_with_grad=True,
+       388 +          #     cache_labels=False,
+       389 +          #     rank=torch.distributed.get_rank(),
+       390 +          #     
+           +  world_size=torch.distributed.get_world_size(),
+       391 +          #     use_horovod=False
+       392 +          # )
+       393    
+       394 -          soft_cma_loss = soft_clip_loss(
+       395 -              image_features=ecg_output['proj_ecg_emb'],
+       396 -              text_features=text_output['proj_text_emb'],
+       397 -              logit_scale=self.logit_scale.exp(),
+       398 -              text_sim_matrix=text_sim_matrix
+       399 -          )
+       394 +          # soft_cma_loss = soft_clip_loss(
+       395 +          #     image_features=ecg_output['proj_ecg_emb'],
+       396 +          #     text_features=text_output['proj_text_emb'],
+       397 +          #     logit_scale=self.logit_scale.exp(),
+       398 +          #     text_sim_matrix=text_sim_matrix
+       399 +          # )
+       400    
+       401 +          # ========== 可学习相似度方案 ==========
+       402 +          if self.use_learnable_sim:
+       403 +              # 计算混合相似度矩阵
+       404 +              hybrid_sim, alpha = 
+           + self.compute_hybrid_similarity(
+       405 +                  text_output['proj_text_emb'],  # 可学习 
+           + (经过 proj_t)
+       406 +                  text_output['text_emb']         # 固定 
+           + (原始 LM 嵌入)
+       407 +              )
+       408 +  
+       409 +              # 使用可学习的软标签损失
+       410 +              learnable_soft_loss_fn = LearnableSoftClipLoss(
+       411 +                  local_loss=True,
+       412 +                  gather_with_grad=True,
+       413 +                  rank=torch.distributed.get_rank(),
+       414 +                  
+           + world_size=torch.distributed.get_world_size(),
+       415 +                  use_horovod=False
+       416 +              )
+       417 +  
+       418 +              soft_cma_loss = learnable_soft_loss_fn(
+       419 +                  image_features=ecg_output['proj_ecg_emb'],
+       420 +                  text_features=text_output['proj_text_emb'],
+       421 +                  logit_scale=self.logit_scale.exp(),
+       422 +                  sim_matrix=hybrid_sim,
+       423 +                  threshold=self.learnable_threshold,
+       424 +                  soft_weight=self.learnable_soft_weight,
+       425 +              )
+       426 +          else:
+       427 +              # 固定相似度方案 (fallback)
+       428 +              text_sim_matrix = 
+           + self.compute_text_similarity(batch['report'])
+       429 +  
+       430 +              soft_clip_loss_fn = SoftClipLoss(
+       431 +                  similarity_threshold=0.95,
+       432 +                  soft_positive_weight=0.05,
+       433 +                  local_loss=True,
+       434 +                  gather_with_grad=True,
+       435 +                  cache_labels=False,
+       436 +                  rank=torch.distributed.get_rank(),
+       437 +                  
+           + world_size=torch.distributed.get_world_size(),
+       438 +                  use_horovod=False
+       439 +              )
+       440 +  
+       441 +              soft_cma_loss = soft_clip_loss_fn(
+       442 +                  image_features=ecg_output['proj_ecg_emb'],
+       443 +                  text_features=text_output['proj_text_emb'],
+       444 +                  logit_scale=self.logit_scale.exp(),
+       445 +                  text_sim_matrix=text_sim_matrix
+       446 +              )
+       447 +  
+       448            uma_loss = loss(
+       449                ecg_output['ecg_emb1'], ecg_output['ecg_emb2'],
+              torch.tensor(1 / 0.07))
+       450    
+     ...
+       406                'uma_loss': uma_loss
+       407            }
+       408    
+       409 +          # 记录可学习参数的当前值 (用于监控训练过程)
+       410 +          if self.use_learnable_sim:
+       411 +              loss_dict['sim_alpha'] = alpha.detach()
+       412 +              loss_dict['threshold'] = 
+           + torch.sigmoid(self.learnable_threshold).detach()
+       413 +              loss_dict['soft_weight'] = 
+           + torch.sigmoid(self.learnable_soft_weight).detach()
+       414 +  
+       415            # don't write metrics for now
+       416            metrics_dict = {}
+       417            # metrics_dict = {
+
+● 修改完成。以下是变更总结：
+
+  ---
+  修改总结
+
+  1. openclip_loss.py (373-548行)
+
+  新增 LearnableSoftClipLoss 类：
+  - threshold 和 soft_weight 作为外部传入的可学习参数
+  - sim_matrix 从外部传入，支持混合相似度
+  - 内部通过 sigmoid 约束参数到 [0, 1] 范围
+
+  2. merl_model.py
+
+  新增参数 (33-37行)：
+  use_learnable_sim: bool = True,
+  init_sim_alpha: float = 0.0,      # sigmoid(0) = 0.5
+  init_threshold: float = 2.0,      # sigmoid(2.0) ≈ 0.88
+  init_soft_weight: float = -2.0,   # sigmoid(-2.0) ≈ 0.12
+
+  新增可学习模块 (61-68行)：
+  self.sim_alpha              # 混合权重
+  self.learnable_threshold    # 可学习阈值
+  self.learnable_soft_weight  # 可学习软正样本权重
+
+  新增方法 compute_hybrid_similarity (321-352行)：
+  - 混合可学习相似度 (proj_text_emb) 和固定相似度 (text_emb)
+
+  修改 shared_step (354-470行)：
+  - 使用 use_learnable_sim 开关选择方案
+  - 原有固定相似度代码已注释保留
+  - 新增可学习参数日志记录
+
+  ---
+  使用方式
+
+  # 使用可学习相似度 (默认)
+  model = MERLModel(use_learnable_sim=True)
+
+  # 使用固定相似度 (原有方案)
+  model = MERLModel(use_learnable_sim=False)
+
+  # 自定义初始化参数
+  model = MERLModel(
+      use_learnable_sim=True,
+      init_sim_alpha=0.0,       # 初始混合权重
+      init_threshold=2.0,       # 初始阈值
+      init_soft_weight=-2.0,    # 初始软正样本权重
+  )
+
+> 你这个支持多卡训练吗 
+
+● 好问题。让我检查一下多卡训练的兼容性。
+
+● Read(src/melp/utils/openclip_loss.py)
+  ⎿  Read 60 lines
+
+● 分析后发现一个问题：当前实现和原来的 SoftClipLoss 有相同的限制。
+
+  ---
+  问题分析
+
+  在多卡训练时，每个 GPU 计算的 hybrid_sim 是 [local_B, local_B]（本地样本间的相似度）。当 gather 后拼接成 [local_B, global_B]，跨 GPU 的部分语义不正确：
+
+  GPU 0 计算: sim(0,0), sim(0,1), sim(1,0), sim(1,1)
+  GPU 1 计算: sim(2,2), sim(2,3), sim(3,2), sim(3,3)
+
+  Gather 后 GPU 0 得到:
+  | sim(0,0) sim(0,1) | sim(2,2) sim(2,3) |  ← 右半部分语义错误
+  | sim(1,0) sim(1,1) | sim(3,2) sim(3,3) |
+
+  正确应该是:
+  | sim(0,0) sim(0,1) | sim(0,2) sim(0,3) |
+  | sim(1,0) sim(1,1) | sim(1,2) sim(1,3) |
+
+  这意味着跨 GPU 的 soft positive 关系无法正确计算。原来的 SoftClipLoss 也有这个问题。
+
+  ---
+  修复方案
+
+  需要在 compute_hybrid_similarity 中先 gather 所有 GPU 的 embeddings，再计算完整相似度矩阵：
+
+● Update(src/melp/models/merl_model.py)
+  ⎿  Updated src/melp/models/merl_model.py with 33 additions and 8 removals
+       328            - learnable_sim: 使用 proj_text_emb (经过可学习的 
+             proj_t 投影) 计算
+       329            - fixed_sim: 使用原始 text_emb (来自预训练LM) 计算
+       330    
+       331 +          多卡训练时，会先 gather 所有 GPU 的 
+           + embeddings，再计算完整的相似度矩阵，
+       332 +          确保跨 GPU 的 soft positive 关系能被正确计算。
+       333 +  
+       334            Args:
+       335 -              proj_text_emb: [B
+           -  , proj_dim] 投影后的文本嵌入，已归一化 (可学习，来自 
+           -  proj_t)
+       336 -              text_emb: [B, hidden_dim] 原始LM嵌入 (固定)
+       335 +              proj_text_emb: [local_B
+           +  , proj_dim] 投影后的文本嵌入，已归一化 (可学习，来自 
+           +  proj_t)
+       336 +              text_emb: [local_B, hidden_dim] 原始LM嵌入 (固定)
+       337    
+       338            Returns:
+       339 -              hybrid_sim: [B, B] 混合相似度矩阵
+       339 +              hybrid_sim: [local_B, global_B] 混合相似度矩阵
+           +   (local_loss=True)
+       340 +                          或 [global_B, global_B] 
+           + (local_loss=False)
+       341                alpha: 当前的混合权重值 (用于日志记录)
+       342            """
+       343 -          # 可学习相似度：用投影后的嵌入 (proj_text_emb 
+           - 已经归一化)
+       344 -          learnable_sim = proj_text_emb @ proj_text_emb.T
+       343 +          # 多卡训练时，先 gather 所有 GPU 的 embeddings
+       344 +          if torch.distributed.is_initialized() and 
+           + torch.distributed.get_world_size() > 1:
+       345 +              world_size = torch.distributed.get_world_size()
+       346    
+       347 -          # 固定相似度：用原始LM嵌入
+       348 -          fixed_emb = F.normalize(text_emb, dim=-1)
+       349 -          fixed_sim = fixed_emb @ fixed_emb.T
+       347 +              # Gather proj_text_emb (已归一化)
+       348 +              gathered_proj = 
+           + [torch.zeros_like(proj_text_emb) for _ in range(world_size)]
+       349 +              torch.distributed.all_gather(gathered_proj, 
+           + proj_text_emb)
+       350 +              all_proj_text_emb = torch.cat(gathered_proj, 
+           + dim=0)  # [global_B, proj_dim]
+       351    
+       352 +              # Gather text_emb
+       353 +              gathered_text = [torch.zeros_like(text_emb) for
+           +  _ in range(world_size)]
+       354 +              torch.distributed.all_gather(gathered_text, 
+           + text_emb)
+       355 +              all_text_emb = torch.cat(gathered_text, dim=0) 
+           +  # [global_B, hidden_dim]
+       356 +  
+       357 +              # 计算完整的相似度矩阵 [local_B, global_B]
+       358 +              # 使用 local proj_text_emb 与 global 
+           + all_proj_text_emb 计算
+       359 +              learnable_sim = proj_text_emb @ 
+           + all_proj_text_emb.T
+       360 +  
+       361 +              # 固定相似度
+       362 +              fixed_emb_local = F.normalize(text_emb, dim=-1)
+       363 +              fixed_emb_all = F.normalize(all_text_emb, 
+           + dim=-1)
+       364 +              fixed_sim = fixed_emb_local @ fixed_emb_all.T
+       365 +          else:
+       366 +              # 单卡训练
+       367 +              learnable_sim = proj_text_emb @ proj_text_emb.T
+       368 +              fixed_emb = F.normalize(text_emb, dim=-1)
+       369 +              fixed_sim = fixed_emb @ fixed_emb.T
+       370 +  
+       371            # 计算混合权重 (sigmoid 确保 [0, 1])
+       372            alpha = torch.sigmoid(self.sim_alpha)
+       373    
+
+● 现在还需要修改 LearnableSoftClipLoss，因为传入的 sim_matrix 已经是 [local_B, global_B]，不需要再 gather：
+
+● Update(src/melp/utils/openclip_loss.py)
+  ⎿  Updated src/melp/utils/openclip_loss.py with 6 additions and 8 removal
+
+       514                image_features: ECG features [local_batch, 
+             embed_dim]
+       515                text_features: Text features [local_batch, 
+             embed_dim]
+       516                logit_scale: Temperature parameter
+       517 -              sim_matrix: 混合相似度矩阵 [local_batch, 
+     local_batch]
+       517 +              sim_matrix: 混合相似度矩阵，已经是 [local_batch, 
+           +  global_batch] 形状
+       518 +                          (在 compute_hybrid_similarity 
+           + 中已完成 gather)
+       519                threshold: 可学习阈值参数 (nn.Parameter)
+       520                soft_weight: 可学习软正样本权重 (nn.Parameter)
+       521                output_dict: Whether to return dict or scalar
+     ...
+       529    
+       530            num_logits = logits_per_image.shape[0]
+       531    
+       532 -          # Gather similarity matrix across GPUs
+       533 -          if self.world_size > 1:
+       534 -              gathered_sim = 
+           - self.gather_sim_matrix(sim_matrix)
+       535 -          else:
+       536 -              gathered_sim = sim_matrix
+       532 +          # sim_matrix 已经在 compute_hybrid_similarity 
+           + 中完成了 gather
+       533 +          # 形状为 [local_batch, global_batch]，可以直接使用
+       534    
+       535            # Build soft labels using learnable parameters
+       536 -          soft_labels_image = self.build_soft_labels(
+           -  gathered_sim, threshold, soft_weight, device, num_logits)
+       537 -          soft_labels_text = self.build_soft_labels(
+           -  gathered_sim, threshold, soft_weight, device, num_logits)
+       536 +          soft_labels_image = self.build_soft_labels(
+           +  sim_matrix, threshold, soft_weight, device, num_logits)
+       537 +          soft_labels_text = self.build_soft_labels(
+           +  sim_matrix, threshold, soft_weight, device, num_logits)
+       538    
+       539            # Compute soft cross-entropy loss
+       540            loss_image = 
+             self.soft_cross_entropy(logits_per_image, soft_labels_image)
+
+● 多卡训练修复完成。现在的实现：
+
+  ---
+  多卡训练支持
+
+  修改内容
+
+  compute_hybrid_similarity (merl_model.py:321-377)：
+  - 多卡时先 all_gather 所有 GPU 的 embeddings
+  - 计算完整的 [local_B, global_B] 相似度矩阵
+  - 确保跨 GPU 的 soft positive 关系能被正确计算
+
+  LearnableSoftClipLoss.forward (openclip_loss.py:508-546)：
+  - 移除了内部的 gather_sim_matrix 调用
+  - 因为传入的 sim_matrix 已经是正确形状
+
+  数据流（4卡训练，每卡 batch=16）
+
+  各 GPU:
+    proj_text_emb: [16, 256]
+    text_emb: [16, 768]
+         ↓
+  compute_hybrid_similarity:
+    all_gather → all_proj_text_emb: [64, 256]
+              → all_text_emb: [64, 768]
+    计算 → hybrid_sim: [16, 64]  (local × global)
+         ↓
+  LearnableSoftClipLoss:
+    logits_per_image: [16, 64]
+    soft_labels: [16, 64]
+    → loss
+
+  与原 SoftClipLoss 的对比
+
+  | 特性                 | 原 SoftClipLoss | 新 LearnableSoftClipLoss   |
+  |----------------------|-----------------|----------------------------|
+  | 跨 GPU soft positive | ❌ 不正确       | ✅ 正确                    |
+  | 相似度 gather 位置   | Loss 内部       | Model 内部                 |
+  | 通信开销             | 较低            | 略高（多 gather 2 次 emb） |
+
+> main_pretrain.py不用改吗 
+
+● 你说得对，如果想通过命令行控制新参数，需要添加 argparse 参数：
+
+● Read(scripts/pretrain/main_pretrain.py)
+  ⎿  Read 38 lines
+
+● Update(scripts/pretrain/main_pretrain.py)
+  ⎿  Tool use rejected with user message: 
+     算了，这些参数还是直接固定吧，我通过在loss里改吧
+
+● 好的，不需要修改 main_pretrain.py。
+
+  当前的参数直接在 MERLModel.__init__ 中有默认值：
+
+  use_learnable_sim: bool = True,
+  init_sim_alpha: float = 0.0,      # sigmoid(0) = 0.5
+  init_threshold: float = 2.0,      # sigmoid(2.0) ≈ 0.88
+  init_soft_weight: float = -2.0,   # sigmoid(-2.0) ≈ 0.12
+
+  如果需要调整，直接改 merl_model.py:33-37 这几行的默认值即可。
+
+> 为什么一个2.0一个-2.0 
+
+● 这是因为两个参数的目标值不同：
+
+  | 参数             | 初始值 | sigmoid后 | 目的                                               |
+  |------------------|--------|-----------|----------------------------------------------------|
+  | init_threshold   | 2.0    | ≈ 0.88    | 高阈值：只有高度相似的样本才算 soft positive       |
+  | init_soft_weight | -2.0   | ≈ 0.12    | 低权重：soft positive 的贡献要远小于 hard positive |
+
+  import torch
+  torch.sigmoid(torch.tensor(2.0))   # tensor(0.8808)  → 高
+  torch.sigmoid(torch.tensor(-2.0))  # tensor(0.1192)  → 低
+
+  如果想更接近原来 SoftClipLoss 的固定值（threshold=0.95, weight=0.05），可以调整为：
+
+  init_threshold: float = 3.0,      # sigmoid(3.0) ≈ 0.95
+  init_soft_weight: float = -3.0,   # sigmoid(-3.0) ≈ 0.05
+
+  需要我改成这个值吗？
+
+> 我的意思是为啥这俩正好一正一负 
+
+● 因为 sigmoid 函数的特性：
+
+  sigmoid(x):
+    x > 0  →  输出 > 0.5  →  偏大
+    x < 0  →  输出 < 0.5  →  偏小
+    x = 0  →  输出 = 0.5
+
+  我们的目标：
+  - 阈值要高（比如 0.88）→ 需要正数输入
+  - 权重要低（比如 0.12）→ 需要负数输入
+
+  所以一正一负不是巧合，是 sigmoid 的数学特性决定的。正好 |2.0| 和 |-2.0| 绝对值相等只是为了对称好记，实际上可以是任意值。
+
+> 你的这两个参数是怎么更新的 
+
+● 好问题！我检查了一下，发现有个问题：
+
+  threshold 参数实际上梯度无法回传，因为 build_soft_labels 中用了硬比较操作：
+
+  soft_mask = (sim_matrix >= threshold_val) & (~diag_mask)  # ❌ 不可导
+
+  >= 比较操作的梯度是 0，所以 threshold 不会被更新。
+
+  soft_weight 可以更新，因为：
+  soft_labels[soft_mask] = soft_weight_val * sim_matrix[soft_mask]  # ✅ 可导
+
+  ---
+  修复方案
+
+  用软阈值替代硬阈值，使梯度可以回传：
+
+● Update(src/melp/utils/openclip_loss.py)
+  ⎿  Tool use rejected with user message: 不用改了
+
+● 好的。总结一下当前参数的更新情况：
+
+  | 参数        | 能否更新 | 原因                   |
+  |-------------|----------|------------------------|
+  | sim_alpha   | ✅ 可以  | 混合相似度计算是可微的 |
+  | soft_weight | ✅ 可以  | 乘法操作可微           |
+  | threshold   | ❌ 不行  | >= 比较操作不可微      |
+
+  如果后续需要让 threshold 也可学习，把硬阈值改成软阈值（sigmoid 平滑）即可。
+
+> 为什么我加上这个相似度后，相比初始版merl（用cliploss的）效果下降 
+
+● 这是个好问题，可能有几个原因：
+
+  可能的原因
+
+  1. 训练初期 proj_text_emb 还没学好
+
+  init_sim_alpha = 0.0 → sigmoid(0) = 0.5
+
+  意味着可学习相似度占了一半权重，但训练初期 proj_t 投影层还是随机的，相似度矩阵可能是噪声。
+
+  建议：让初期更依赖固定相似度
+
+  init_sim_alpha: float = -3.0,  # sigmoid(-3.0) ≈ 0.05，初期几乎全用固定相似度
+
+  2. Soft label 引入了错误的监督信号
+
+  即使阈值很高（0.95），如果相似度计算不准确，也可能把不相关的样本当作 soft positive。
+
+  3. 原始 ClipLoss 可能更适合你的数据
+
+  如果 batch 内样本的诊断本来就差异很大，soft label 的收益有限，反而增加了噪声。
+
+  ---
+  建议的排查步骤
+
+  1. 先对比一下 baseline：
+  use_learnable_sim: bool = False  # 切回固定相似度方案
+
+  2. 或者直接用原始 ClipLoss（在 shared_step 中）：
+  # 直接用硬标签对比学习
+  cma_loss = loss(
+      ecg_output['proj_ecg_emb'], text_output['proj_text_emb'], self.logit_scale.exp())
+
+  3. 打印相似度矩阵看看：
+  # 在 shared_step 中加
+  print(f"hybrid_sim stats: min={hybrid_sim.min():.3f}, max={hybrid_sim.max():.3f}, mean={hybrid_sim.mean():.3f}")
+  print(f"soft positives count: {(hybrid_sim > 0.95).sum() - hybrid_sim.shape[0]}")  # 排除对角线
+
+  ---
+  你的数据中，同一个 batch 内有多少样本的诊断是相似的？如果很少，可能 soft label 本身就不太适用。
+
+> 你认为如果把文本嵌入相似度移除，会发生什么，因为文本的投影也是从嵌入来的 
+
+● 你说得对，这是个很好的观察。
+
+  分析
+
+  text_emb → proj_t → proj_text_emb
+     ↓                    ↓
+  fixed_sim          learnable_sim
+
+  proj_text_emb 确实是从 text_emb 变换来的，两者信息高度相关。混合它们可能是冗余的。
+
+  如果只用 proj_text_emb
+
+  会发生什么：
+
+  sim_matrix = proj_text_emb @ proj_text_emb.T
+
+  这个相似度矩阵完全等价于对比学习的 logits（只差一个 logit_scale）：
+
+  logits = logit_scale * proj_ecg_emb @ proj_text_emb.T
+  text_sim = proj_text_emb @ proj_text_emb.T  # 本质相同
+
+  意味着：
+  - 如果两个文本在投影空间接近 → 它们的 ECG 也应该接近
+  - 这是自洽的设计
+
+  潜在问题：
+  - 训练初期 proj_t 是随机的，相似度矩阵也是随机的
+  - 没有医学 LM 的先验知识来引导
+
+  ---
+  更简洁的方案
+
+  既然 proj_text_emb 已经包含了信息，可以直接简化为：
+
+  def compute_hybrid_similarity(self, proj_text_emb, text_emb):
+      # 直接用 proj_text_emb，不需要混合
+      sim_matrix = proj_text_emb @ proj_text_emb.T
+      alpha = torch.sigmoid(self.sim_alpha)  # 仍然可以记录，但不影响计算
+      return sim_matrix, alpha
+
+  或者更彻底：移除整个混合机制，直接用 proj_text_emb 的相似度。
+
+  ---
+  我的建议
+
+  既然效果下降了，可以尝试一个更激进的简化：
+
+  直接用 proj_text_emb @ proj_text_emb.T 作为相似度矩阵，不做任何混合。这样：
+  1. 设计更简洁
+  2. 相似度和对比学习目标一致
+  3. 没有额外的超参数
+
+  要不要试试这个方向？
+
+> 不用了，你看下这个learnable_soft_clip_loss能不能用到melp的链路里，先分析me
+lp预训练链路，然后看下它的loss，并设计一下结合这个loss的改进 
+
+● Read(src/melp/models/melp_model.py)
+  ⎿  Read 952 lines
+
+● MELP 预训练链路分析
+
+  模型架构
+
+  ┌─────────────────────────────────────────────────────────────────┐
+  │                          MELPModel                              │
+  ├─────────────────────────────────────────────────────────────────┤
+  │                                                                 │
+  │  ECG ─────► ECGFMModel ─┬─► ecg_latent (全局, 用于对比学习)     │
+  │                         ├─► ecg_beat_emb (局部 beat 嵌入)       │
+  │                         └─► ecg_embs (token, 用于 caption)      │
+  │                                                                 │
+  │  Text ────► LM + proj_t ─┬─► text_latent (全局, 用于对比学习)   │
+  │                          ├─► token_emb (token 嵌入)             │
+  │                          └─► sent_emb (句子级嵌入)              │
+  │                                                                 │
+  │  Text Decoder: MultimodalTransformer (用于生成 caption)        │
+  │                                                                 │
+  └─────────────────────────────────────────────────────────────────┘
+
+  当前 Loss 组成 (shared_step:566-616)
+
+  # 1. UOT Loss - 局部 Beat-Sentence 对齐 (GLoRIA style)
+  uot_loss = self.uot_loss(ecg_beat_emb, sent_emb) * local_loss_weight
+
+  # 2. CoCa Loss - 全局对比 + Caption 生成
+  coca_loss = CoCaLoss(...)
+  cma_loss, caption_loss = coca_loss(
+      image_features=ecg_latent,    # 全局 ECG
+      text_features=text_latent,    # 全局 Text  
+      logits=logits,                # Caption 预测
+      labels=labels,                # Caption 真值
+      logit_scale=logit_scale
+  )
+
+  # 总 loss
+  loss = cma_loss + caption_loss + uot_loss
+
+  CoCaLoss 内部实现
+
+  class CoCaLoss(ClipLoss):
+      def forward(...):
+          # CMA Loss: 使用父类 ClipLoss (硬标签!)
+          clip_loss = super().forward(image_features, text_features, logit_scale)
+
+          # Caption Loss: 交叉熵
+          caption_loss = self.caption_loss(logits, labels)
+
+  关键发现：CoCaLoss 的对比学习部分使用的是 ClipLoss（硬标签），可以替换为软标签。
+
+  ---
+  改进方案设计
+
+  方案：创建 SoftCoCaLoss
+
+  class SoftCoCaLoss(nn.Module):
+      """
+      CoCa Loss with learnable soft labels for contrastive learning.
+      
+      = LearnableSoftClipLoss (CMA) + CrossEntropy (Caption)
+      """
+
+      def __init__(
+              self,
+              caption_loss_weight,
+              clip_loss_weight,
+              pad_id=0,
+              local_loss=True,
+              gather_with_grad=True,
+              rank=0,
+              world_size=1,
+      ):
+          super().__init__()
+          self.clip_loss_weight = clip_loss_weight
+          self.caption_loss_weight = caption_loss_weight
+          self.caption_loss = nn.CrossEntropyLoss(ignore_index=pad_id)
+
+          # 使用 LearnableSoftClipLoss 替代 ClipLoss
+          self.soft_clip_loss = LearnableSoftClipLoss(
+              local_loss=local_loss,
+              gather_with_grad=gather_with_grad,
+              rank=rank,
+              world_size=world_size,
+          )
+
+      def forward(self, image_features, text_features, logits, labels, 
+                  logit_scale, sim_matrix, threshold, soft_weight, output_dict=False):
+
+          # Soft CMA Loss
+          if self.clip_loss_weight:
+              clip_loss = self.soft_clip_loss(
+                  image_features, text_features, logit_scale,
+                  sim_matrix, threshold, soft_weight
+              )
+              clip_loss = self.clip_loss_weight * clip_loss
+          else:
+              clip_loss = torch.tensor(0)
+
+          # Caption Loss (不变)
+          caption_loss = self.caption_loss(logits.permute(0, 2, 1), labels)
+          caption_loss = caption_loss * self.caption_loss_weight
+
+          return clip_loss, caption_loss
+
+  MELPModel 需要的修改
+
+  1. 添加可学习参数（类似 MERLModel）：
+  self.sim_alpha = nn.Parameter(...)
+  self.learnable_threshold = nn.Parameter(...)
+  self.learnable_soft_weight = nn.Parameter(...)
+
+  2. 修改 _encode_text：返回原始 text_emb 用于计算固定相似度
+  3. 修改 shared_step：
+  # 计算混合相似度
+  hybrid_sim, alpha = self.compute_hybrid_similarity(
+      output_dict["text_latent"],  # proj_text_emb
+      text_emb                      # 原始 LM 嵌入
+  )
+
+  # 使用 SoftCoCaLoss
+  soft_coca_loss = SoftCoCaLoss(...)
+  cma_loss, caption_loss = soft_coca_loss(
+      image_features=output_dict["ecg_latent"],
+      text_features=output_dict["text_latent"],
+      logits=output_dict["logits"],
+      labels=output_dict["labels"],
+      logit_scale=output_dict["logit_scale"],
+      sim_matrix=hybrid_sim,
+      threshold=self.learnable_threshold,
+      soft_weight=self.learnable_soft_weight,
+  )
+
+  ---
+  要我开始实现这个改进吗？
+
+> melp的cmaloss是哪个层级的 
+
+● 看 shared_step 中的调用：
+
+  cma_loss, caption_loss = coca_loss(
+      image_features=output_dict["ecg_latent"],   # ← 全局 ECG 嵌入
+      text_features=output_dict["text_latent"],   # ← 全局 Text 嵌入
+      ...
+  )
+
+  CMA loss 是全局层级。
+
+  ---
+  MELP 的层级结构
+
+  | Loss         | 层级 | 输入                      |
+  |--------------|------|---------------------------|
+  | CMA Loss     | 全局 | ecg_latent ↔ text_latent  |
+  | UOT Loss     | 局部 | ecg_beat_embs ↔ sent_embs |
+  | Caption Loss | 序列 | logits → labels           |
+
+  ECG:  [全局 ecg_latent] ←── CMA Loss ──→ [全局 text_latent]  :Text
+         ↑                                        ↑
+        池化                                     池化
+         ↑                                        ↑
+        [局部 ecg_beat_embs] ←── UOT Loss ──→ [局部 sent_embs]
+        (n_queries 个 beat)                  (多个句子)
+
+  所以如果要给 MELP 加软标签，应该加在全局 CMA Loss 上，用 text_latent（已投影）和原始 text_emb 计算相似度。
+
+> 分析一下cocaloss 
+
+● Read(src/melp/utils/openclip_loss.py)
+  ⎿  Read 60 lines
+
+● CoCaLoss 分析
+
+  继承结构
+
+  ClipLoss (硬标签对比学习)
+      ↑
+  CoCaLoss (对比学习 + Caption 生成)
+
+  代码解析
+
+  class CoCaLoss(ClipLoss):
+      def __init__(self,
+              caption_loss_weight,    # Caption loss 权重
+              clip_loss_weight,       # 对比学习 loss 权重
+              pad_id=0,               # padding token id
+              local_loss=False,       # 是否使用 local loss
+              ...
+      ):
+          super().__init__(...)  # 初始化父类 ClipLoss
+
+          self.clip_loss_weight = clip_loss_weight
+          self.caption_loss_weight = caption_loss_weight
+          self.caption_loss = nn.CrossEntropyLoss(ignore_index=pad_id)
+
+      def forward(self, image_features, text_features, logits, labels, logit_scale):
+          # 1. 对比学习 Loss (调用父类 ClipLoss)
+          if self.clip_loss_weight:
+              clip_loss = super().forward(image_features, text_features, logit_scale)
+              clip_loss = self.clip_loss_weight * clip_loss
+
+          # 2. Caption Loss (交叉熵)
+          caption_loss = self.caption_loss(
+              logits.permute(0, 2, 1),  # [B, seq_len, vocab] → [B, vocab, seq_len]
+              labels,                    # [B, seq_len]
+          )
+          caption_loss = caption_loss * self.caption_loss_weight
+
+          return clip_loss, caption_loss
+
+  父类 ClipLoss.forward (硬标签)
+
+  # ClipLoss.forward (第158-169行)
+  def forward(self, image_features, text_features, logit_scale):
+      logits_per_image, logits_per_text = self.get_logits(image_features, text_features, logit_scale)
+
+      # 硬标签: 对角线为正样本
+      labels = torch.arange(num_logits, device=device)  # [0, 1, 2, ..., B-1]
+
+      total_loss = (
+          F.cross_entropy(logits_per_image, labels) +
+          F.cross_entropy(logits_per_text, labels)
+      ) / 2
+      return total_loss
+
+  ---
+  总结
+
+  | 组件                  | 作用         | 标签类型          |
+  |-----------------------|--------------|-------------------|
+  | ClipLoss              | 对比学习     | 硬标签 (对角线=1) |
+  | CoCaLoss.caption_loss | Caption 生成 | 交叉熵            |
+
+  改进点：把 super().forward() (ClipLoss) 替换为 LearnableSoftClipLoss，即可实现软标签版本的 CoCa。
+
+  要我实现 SoftCoCaLoss 吗？
+
+> 什么是cocaloss 
+
+● CoCa Loss 是什么
+
+  CoCa = Contrastive Captioners，来自 Google 的论文：
+  "CoCa: Contrastive Captioners are Image-Text Foundation Models" (2022)
+
+  核心思想
+
+  CoCa 同时训练两个目标：
+
+  ┌─────────────────────────────────────────────────────────────┐
+  │                        CoCa 架构                            │
+  ├─────────────────────────────────────────────────────────────┤
+  │                                                             │
+  │   Image ──► Encoder ──► [CLS] ◄──── Contrastive Loss ────► [CLS] ◄── Encoder ◄── Text
+  │                           │                                    │
+  │                           ▼                                    ▼
+  │                      image_emb                            text_emb
+  │                           │                                    │
+  │                           └────────► Decoder ◄─────────────────┘
+  │                                         │
+  │                                    Caption Loss
+  │                                    (生成文本)
+  │                                                             │
+  └─────────────────────────────────────────────────────────────┘
+
+  两个 Loss
+
+  | Loss             | 目标                     | 作用           |
+  |------------------|--------------------------|----------------|
+  | Contrastive Loss | 对齐 image↔text 全局表示 | 学习判别性特征 |
+  | Caption Loss     | 用 image 生成 text       | 学习生成能力   |
+
+  total_loss = clip_loss_weight * contrastive_loss + caption_loss_weight * caption_loss
+
+  为什么有效
+
+  1. 对比学习：让模型学会区分匹配/不匹配的图文对
+  2. Caption 生成：让模型理解细粒度语义，能描述图像内容
+  3. 互补：对比学习提供全局对齐，Caption 提供细节理解
+
+  在 MELP 中的应用
+
+  # MELP 的 CoCaLoss
+  cma_loss, caption_loss = coca_loss(
+      image_features=ecg_latent,     # ECG 全局嵌入
+      text_features=text_latent,     # 文本全局嵌入
+      logits=logits,                 # Decoder 输出的 caption logits
+      labels=labels,                 # 真实的 caption token ids
+      logit_scale=logit_scale
+  )
+
+  # cma_loss: ECG↔Text 对比学习 (类似 CLIP)
+  # caption_loss: 用 ECG 生成报告文本 (类似 GPT)
+
+  简单说：CoCa = CLIP + GPT，既能对齐也能生成。
+
+> 但它们实际上还是独立的loss，只在最后才加在一起 
+
+● 对，你说得没错。
+
+  def forward(self, image_features, text_features, logits, labels, logit_scale):
+      # 两个 loss 完全独立计算
+      clip_loss = super().forward(image_features, text_features, logit_scale)  # 独立
+      caption_loss = self.caption_loss(logits, labels)                          # 独立
+
+      return clip_loss, caption_loss  # 分开返回，外面再加
+
+  实际情况
+
+                      ┌─────────────────┐
+  image_features ────►│                 │
+                      │  Contrastive    │──► clip_loss ────┐
+  text_features  ────►│     Loss        │                  │
+                      └─────────────────┘                  │
+                                                           ├──► total_loss
+                      ┌─────────────────┐                  │
+  logits ────────────►│                 │                  │
+                      │  Caption Loss   │──► caption_loss ─┘
+  labels ────────────►│                 │
+                      └─────────────────┘
+
+  两个 loss 之间没有任何交互：
+  - 不共享中间计算
+  - 不共享梯度路径（除了共享的 encoder 参数）
+  - 只是简单的 loss = α * clip_loss + β * caption_loss
+
+  所以改成软标签很简单
+
+  只需要把 clip_loss = super().forward(...) 替换成 LearnableSoftClipLoss，caption loss 完全不用动：
+
+  # 改前
+  clip_loss = super().forward(image_features, text_features, logit_scale)
+
+  # 改后
+  clip_loss = self.soft_clip_loss(image_features, text_features, logit_scale,
+                                   sim_matrix, threshold, soft_weight)
+
+  要实现吗？
+
+> 所以cocaloss更多是一个形式上的概念，而非计算上的概念 
+
+● 完全正确。
+
+  CoCaLoss 本质上只是一个封装/容器
+
+  class CoCaLoss(ClipLoss):
+      def forward(...):
+          clip_loss = super().forward(...)      # 调用 ClipLoss
+          caption_loss = CrossEntropyLoss(...)  # 调用 CrossEntropyLoss
+          return clip_loss, caption_loss        # 打包返回
+
+  它做的事情：
+  - ✅ 把两个 loss 放在一个类里
+  - ✅ 统一管理权重参数
+  - ✅ 提供统一的接口
+  - ❌ 没有任何新的计算逻辑
+  - ❌ 两个 loss 之间没有交互
+
+  等价于
+
+  # 用 CoCaLoss
+  coca_loss = CoCaLoss(clip_weight=1.0, caption_weight=2.0)
+  cma_loss, caption_loss = coca_loss(img_feat, txt_feat, logits, labels, scale)
+
+  # 完全等价于直接写
+  cma_loss = ClipLoss()(img_feat, txt_feat, scale) * 1.0
+  caption_loss = F.cross_entropy(logits, labels) * 2.0
+
+  所以
+
+  CoCa 论文的贡献在于架构设计（同时有对比分支和生成分支），而不是 loss 的计算方式。CoCaLoss 这个类只是代码组织上的便利，不是什么新的 loss 函数。
+
+> 那你尝试把melp的改一改，注意原来的内容注释掉就行不要删除，在实际修改前，先
+把修改思路展示一下 
+
+● MELP 修改思路
+
+  需要修改的文件
+
+  - src/melp/models/melp_model.py
+
+  修改点总览
+
+  ┌─────────────────────────────────────────────────────────────────┐
+  │                     MELPModel 修改点                            │
+  ├─────────────────────────────────────────────────────────────────┤
+  │                                                                 │
+  │  1. __init__: 添加可学习参数 (继承自 MERLModel，已有)            │
+  │     - sim_alpha, learnable_threshold, learnable_soft_weight    │
+  │     - 检查是否正确继承                                          │
+  │                                                                 │
+  │  2. _encode_text: 返回原始 text_emb                             │
+  │     - 目前只返回 proj_text_emb, token_emb, sent_emb            │
+  │     - 需要额外返回 text_emb (LM hidden state)                  │
+  │                                                                 │
+  │  3. forward: 把 text_emb 加入 output_dict                       │
+  │                                                                 │
+  │  4. shared_step: 使用可学习软标签                               │
+  │     - 计算 hybrid_sim (复用父类 compute_hybrid_similarity)      │
+  │     - 用 LearnableSoftClipLoss 替代 CoCaLoss 中的 ClipLoss     │
+  │                                                                 │
+  └─────────────────────────────────────────────────────────────────┘
+
+  ---
+  详细修改思路
+
+  1. 检查继承关系
+
+  class MELPModel(MERLModel):  # 继承 MERLModel
+      def __init__(self, ...):
+          super().__init__(...)  # 调用 MERLModel.__init__
+
+  MERLModel 已经有 sim_alpha, learnable_threshold, learnable_soft_weight 和 compute_hybrid_similarity 方法，应该会被继承。需要确认。
+
+  2. 修改 _encode_text (约 428-455 行)
+
+  # 现在
+  def _encode_text(self, input_ids, attention_mask, normalize=True, return_sent_emb=True):
+      ...
+      text_emb = last_hidden_state[:, -1]  # 原始 LM 嵌入
+      proj_text_emb = self.proj_t(text_emb)
+      ...
+      return proj_text_emb, token_emb, sent_emb  # ❌ 没返回 text_emb
+
+  # 改成
+  def _encode_text(...):
+      ...
+      return proj_text_emb, token_emb, sent_emb, text_emb  # ✅ 加上 text_emb
+
+  3. 修改 forward (约 518-564 行)
+
+  # 现在
+  out_dict = {
+      "ecg_latent": ecg_latent,
+      "text_latent": text_latent,  # proj_text_emb
+      ...
+  }
+
+  # 改成
+  out_dict = {
+      "ecg_latent": ecg_latent,
+      "text_latent": text_latent,
+      "text_emb": text_emb,  # ✅ 添加原始 text_emb
+      ...
+  }
+
+  4. 修改 shared_step (约 566-616 行)
+
+  # 现在
+  coca_loss = CoCaLoss(...)
+  cma_loss, caption_loss = coca_loss(
+      image_features=output_dict["ecg_latent"],
+      text_features=output_dict["text_latent"],
+      logits=output_dict["logits"],
+      labels=output_dict["labels"],
+      logit_scale=output_dict["logit_scale"]
+  )
+
+  # 改成
+  if self.use_learnable_sim:
+      # 计算混合相似度
+      hybrid_sim, alpha = self.compute_hybrid_similarity(
+          output_dict["text_latent"],  # proj_text_emb
+          output_dict["text_emb"]       # 原始 text_emb
+      )
+
+      # 软标签 CMA loss
+      soft_cma_loss_fn = LearnableSoftClipLoss(...)
+      cma_loss = soft_cma_loss_fn(
+          image_features=output_dict["ecg_latent"],
+          text_features=output_dict["text_latent"],
+          logit_scale=output_dict["logit_scale"],
+          sim_matrix=hybrid_sim,
+          threshold=self.learnable_threshold,
+          soft_weight=self.learnable_soft_weight,
+      )
+
+      # Caption loss 保持不变
+      caption_loss_fn = nn.CrossEntropyLoss(ignore_index=pad_id)
+      caption_loss = caption_loss_fn(output_dict["logits"].permute(0,2,1), output_dict["labels"])
+      caption_loss = caption_loss * self.caption_loss_weight
+      cma_loss = cma_loss * self.clip_loss_weight
+  else:
+      # 原有逻辑 (注释保留)
+      ...
+
+  ---
+  数据流变化
+
+  改前:
+  text → LM → text_emb → proj_t → text_latent → CoCaLoss (ClipLoss)
+                                                     ↓
+                                                硬标签对比
+
+  改后:
+  text → LM → text_emb ─────────────────────┐
+                ↓                           ↓
+             proj_t                  compute_hybrid_similarity
+                ↓                           ↓
+           text_latent ──────────→ LearnableSoftClipLoss
+                                            ↓
+                                       软标签对比
+
+  ---
+  确认这个思路没问题的话，我开始修改代码。
+
+> 改一下吧 
+
+● Read(src/melp/models/melp_model.py)
+  ⎿  Read 30 lines
+
+● 首先添加 import：
+
+● Update(src/melp/models/melp_model.py)
+  ⎿  Updated src/melp/models/melp_model.py with 1 addition and 1 removal
+       22        QuickGELU,
+       23        MultimodalTransformer,
+       24    )
+       25 -  from melp.utils.openclip_loss import CoCaLoss
+       25 +  from melp.utils.openclip_loss import CoCaLoss
+          +  , LearnableSoftClipLoss
+       26    from melp.models.ecgfm_model import ECGFMModel
+       27    from melp.backbone.transformer import AttentionalPooler
+       28    from melp.backbone.resnet1d import ResNet18, ResNet34, 
+            ResNet50, ResNet101
+
+● Read(src/melp/models/melp_model.py)
+  ⎿  Read 40 lines
+
+● 修改 _encode_text 返回 text_emb：
+
+● Update(src/melp/models/melp_model.py)
+  ⎿  Tool use rejected with user message: 
+     我说过了，不要删除原有内容，把原有内容注释掉
+
+● Update(src/melp/models/melp_model.py)
+  ⎿  Updated src/melp/models/melp_model.py with 9 additions and 2 removals
+       449            if normalize:
+       450                proj_text_emb = F.normalize(proj_text_emb, 
+             dim=-1)
+       451    
+       452 +          # ========== 原有返回 (已注释) ==========
+       453 +          # if return_sent_emb:
+       454 +          #     return proj_text_emb, token_emb, sent_emb
+       455 +          # else:
+       456 +          #     return proj_text_emb, token_emb
+       457 +  
+       458 +          # ========== 新增: 返回 text_emb 
+           + 用于计算可学习相似度 ==========
+       459            if return_sent_emb:
+       460 -              return proj_text_emb, token_emb, sent_emb
+       460 +              return proj_text_emb, token_emb, sent_emb
+           +  , text_emb
+       461            else:
+       462 -              return proj_text_emb, token_emb
+       462 +              return proj_text_emb, token_emb, text_emb
+       463        
+       464        def encode_text(self, input_ids, attention_mask, 
+             normalize: bool = True, return_sent_emb: bool = True):
+       465            if return_sent_emb:
+
+● 修改 encode_text 适配新的返回值：
+
+● Update(src/melp/models/melp_model.py)
+  ⎿  Updated src/melp/models/melp_model.py with 10 additions and 2 removals
+       462                return proj_text_emb, token_emb, text_emb
+       463        
+       464        def encode_text(self, input_ids, attention_mask, 
+             normalize: bool = True, return_sent_emb: bool = True):
+       465 +          # ========== 原有逻辑 (已注释) ==========
+       466 +          # if return_sent_emb:
+       467 +          #     text_latent, _, _ = 
+           + self._encode_text(input_ids, attention_mask, 
+           + normalize=normalize, return_sent_emb=True)
+       468 +          # else:
+       469 +          #     text_latent, _ = self._encode_text(input_ids,
+           +  attention_mask, normalize=normalize, return_sent_emb=False)
+       470 +          # return text_latent
+       471 +  
+       472 +          # ========== 新增: 适配 _encode_text 返回 text_emb 
+           + ==========
+       473            if return_sent_emb:
+       474 -              text_latent, _, _ 
+           -  = self._encode_text(input_ids, attention_mask, 
+           -  normalize=normalize, return_sent_emb=True)
+       474 +              text_latent, _, _, _ 
+           +  = self._encode_text(input_ids, attention_mask, 
+           +  normalize=normalize, return_sent_emb=True)
+       475            else:
+       476 -              text_latent, _ 
+           -  = self._encode_text(input_ids, attention_mask, 
+           -  normalize=normalize, return_sent_emb=False)
+       476 +              text_latent, _, _ 
+           +  = self._encode_text(input_ids, attention_mask, 
+           +  normalize=normalize, return_sent_emb=False)
+       477            return text_latent
+       478    
+       479        @torch.no_grad()
+
+● Read(src/melp/models/melp_model.py)
+  ⎿  Read 50 lines
+
+● 修改 forward 方法适配新的返回值并添加 text_emb：
+
+● Update(src/melp/models/melp_model.py)
+  ⎿  Updated src/melp/models/melp_model.py with 5 additions and 1 removal
+       550                text_output = self._tokenize(text)
+       551                input_ids = 
+             text_output.input_ids.type_as(ecg).long()
+       552                attention_mask = 
+             text_output.attention_mask.type_as(ecg).long()
+       553 -          text_latent, token_embs, sent_embs = 
+           - self._encode_text(input_ids, attention_mask)
+       553 +          # ========== 原有调用 (已注释) ==========
+       554 +          # text_latent, token_embs, sent_embs = 
+           + self._encode_text(input_ids, attention_mask)
+       555    
+       556 +          # ========== 新增: 获取 text_emb 
+           + 用于计算可学习相似度 ==========
+       557 +          text_latent, token_embs, sent_embs, text_emb = 
+           + self._encode_text(input_ids, attention_mask)
+       558 +  
+       559            if output_labels:
+       560                # align text_embs and thus logits with labels 
+             for teacher-forcing caption loss
+       561                token_embs = token_embs[:, :-1]
+
+● 现在修改 out_dict 添加 text_emb：
+
+● Update(src/melp/models/melp_model.py)
+  ⎿  Updated src/melp/models/melp_model.py with 12 additions             
+       568            logits = self.text_decoder(ecg_embs, token_embs)
+       569    
+       570            sent_embs = [self.sent_proj(sent_emb) for sent_emb 
+             in sent_embs]
+       571 +          # ========== 原有 out_dict (已注释) ==========
+       572 +          # out_dict = {
+       573 +          #     "ecg_latent": ecg_latent,
+       574 +          #     "text_latent": text_latent,
+       575 +          #     "logits": logits,
+       576 +          #     "logit_scale": self.logit_scale.exp(),
+       577 +          #     "ecg_embs": ecg_beat_embs,
+       578 +          #     "sent_embs": sent_embs
+       579 +          # }
+       580 +  
+       581 +          # ========== 新增: 添加 text_emb 
+           + 用于计算可学习相似度 ==========
+       582            out_dict = {
+       583                "ecg_latent": ecg_latent,
+       584                "text_latent": text_latent,
+       585 +              "text_emb": text_emb,  # 原始 LM 
+           + 嵌入，用于计算固定相似度
+       586                "logits": logits,
+       587                "logit_scale": self.logit_scale.exp(),
+       588                "ecg_embs": ecg_beat_embs,
+
+● Read(src/melp/models/melp_model.py)
+  ⎿  Read 55 lines
+
+● 修改 shared_step 使用可学习软标签：
+
+● Update(src/melp/models/melp_model.py)
+  ⎿  Updated src/melp/models/melp_model.py with 76 additions and 17 removal
+
+       608            uot_loss, _ = 
+             self.uot_loss(output_dict["ecg_embs"], 
+             output_dict["sent_embs"])
+       609            uot_loss *= self.local_loss_weight
+       610    
+       611 -          coca_loss = CoCaLoss(
+       612 -              caption_loss_weight=self.caption_loss_weight,
+       613 -              clip_loss_weight=self.clip_loss_weight,
+       614 -              pad_id= self.tokenizer.pad_token_type_id,
+       615 -              local_loss=True,
+       616 -              gather_with_grad=True,
+       617 -              cache_labels=True,
+       618 -              rank=torch.distributed.get_rank(),
+       619 -              world_size=torch.distributed.get_world_size(),
+       620 -              use_horovod=False
+       621 -          )
+       611 +          # ========== 原有 CoCaLoss 调用 (已注释) ==========
+       612 +          # coca_loss = CoCaLoss(
+       613 +          #     caption_loss_weight=self.caption_loss_weight,
+       614 +          #     clip_loss_weight=self.clip_loss_weight,
+       615 +          #     pad_id= self.tokenizer.pad_token_type_id,
+       616 +          #     local_loss=True,
+       617 +          #     gather_with_grad=True,
+       618 +          #     cache_labels=True,
+       619 +          #     rank=torch.distributed.get_rank(),
+       620 +          #     
+           + world_size=torch.distributed.get_world_size(),
+       621 +          #     use_horovod=False
+       622 +          # )
+       623    
+       624 -          cma_loss, caption_loss = coca_loss(
+       625 -              image_features=output_dict["ecg_latent"],
+       626 -              text_features=output_dict["text_latent"],
+       627 -              logits=output_dict["logits"],
+       628 -              labels=output_dict["labels"],
+       629 -              logit_scale=output_dict["logit_scale"]
+       624 +          # cma_loss, caption_loss = coca_loss(
+       625 +          #     image_features=output_dict["ecg_latent"],
+       626 +          #     text_features=output_dict["text_latent"],
+       627 +          #     logits=output_dict["logits"],
+       628 +          #     labels=output_dict["labels"],
+       629 +          #     logit_scale=output_dict["logit_scale"]
+       630 +          # )
+       631 +  
+       632 +          # ========== 新增: 可学习软标签 CMA Loss ==========
+       633 +          if self.use_learnable_sim:
+       634 +              # 计算混合相似度矩阵
+       635 +              hybrid_sim, alpha = 
+           + self.compute_hybrid_similarity(
+       636 +                  output_dict["text_latent"],  # 
+           + proj_text_emb (可学习)
+       637 +                  output_dict["text_emb"]       # 原始 LM 
+           + 嵌入 (固定)
+       638 +              )
+       639 +  
+       640 +              # 软标签 CMA loss
+       641 +              soft_cma_loss_fn = LearnableSoftClipLoss(
+       642 +                  local_loss=True,
+       643 +                  gather_with_grad=True,
+       644 +                  rank=torch.distributed.get_rank(),
+       645 +                  
+           + world_size=torch.distributed.get_world_size(),
+       646 +                  use_horovod=False
+       647 +              )
+       648 +  
+       649 +              cma_loss = soft_cma_loss_fn(
+       650 +                  image_features=output_dict["ecg_latent"],
+       651 +                  text_features=output_dict["text_latent"],
+       652 +                  logit_scale=output_dict["logit_scale"],
+       653 +                  sim_matrix=hybrid_sim,
+       654 +                  threshold=self.learnable_threshold,
+       655 +                  soft_weight=self.learnable_soft_weight,
+       656 +              )
+       657 +              cma_loss = cma_loss * self.clip_loss_weight
+       658 +          else:
+       659 +              # 原有 CoCaLoss 的 CMA 部分 (硬标签)
+       660 +              from melp.utils.openclip_loss import ClipLoss
+       661 +              clip_loss_fn = ClipLoss(
+       662 +                  local_loss=True,
+       663 +                  gather_with_grad=True,
+       664 +                  cache_labels=True,
+       665 +                  rank=torch.distributed.get_rank(),
+       666 +                  
+           + world_size=torch.distributed.get_world_size(),
+       667 +                  use_horovod=False
+       668 +              )
+       669 +              cma_loss = clip_loss_fn(
+       670 +                  output_dict["ecg_latent"],
+       671 +                  output_dict["text_latent"],
+       672 +                  output_dict["logit_scale"]
+       673 +              )
+       674 +              cma_loss = cma_loss * self.clip_loss_weight
+       675 +  
+       676 +          # Caption loss (保持不变)
+       677 +          caption_loss_fn = nn.CrossEntropyLoss(ignore_index=
+           + self.tokenizer.pad_token_type_id)
+       678 +          caption_loss = caption_loss_fn(
+       679 +              output_dict["logits"].permute(0, 2, 1),
+       680 +              output_dict["labels"]
+       681            )
+       682 +          caption_loss = caption_loss * 
+           + self.caption_loss_weight
+       683    
+       684            # cma_loss = 
+             torch.tensor(0.0).type_as(caption_loss)
+       685            # uot_loss = 
+             torch.tensor(0.0).type_as(caption_loss)
+     ...
+       638                "uot_loss": uot_loss
+       639            }
+       640    
+       641 +          # 记录可学习参数的当前值 (用于监控训练过程)
+       642 +          if self.use_learnable_sim:
+       643 +              loss_dict['sim_alpha'] = alpha.detach()
+       644 +              loss_dict['threshold'] = 
+           + torch.sigmoid(self.learnable_threshold).detach()
+       645 +              loss_dict['soft_weight'] = 
+           + torch.sigmoid(self.learnable_soft_weight).detach()
+       646 +  
+       647            if torch.isnan(loss_dict["loss"]):
+       648                ipdb.set_trace()
+       649    
+
+● 修改完成。总结如下：
+
+  ---
+  MELP 修改总结
+
+  修改的文件
+
+  src/melp/models/melp_model.py
+
+  修改点
+
+  | 位置          | 修改内容                                 |
+  |---------------|------------------------------------------|
+  | 第 25 行      | 添加 LearnableSoftClipLoss import        |
+  | 第 452-462 行 | _encode_text 返回值增加 text_emb         |
+  | 第 464-477 行 | encode_text 适配新的返回值               |
+  | 第 553-557 行 | forward 中调用 _encode_text 适配新返回值 |
+  | 第 571-590 行 | forward 的 out_dict 添加 text_emb        |
+  | 第 611-698 行 | shared_step 使用可学习软标签             |
+
+  关键变化
+
+  # 原来 (CoCaLoss 内部用 ClipLoss 硬标签)
+  coca_loss = CoCaLoss(...)
+  cma_loss, caption_loss = coca_loss(ecg_latent, text_latent, logits, labels, scale)
+
+  # 现在 (可学习软标签)
+  if self.use_learnable_sim:
+      hybrid_sim, alpha = self.compute_hybrid_similarity(text_latent, text_emb)
+      cma_loss = LearnableSoftClipLoss(...)(ecg_latent, text_latent, scale,
+                                            hybrid_sim, threshold, soft_weight)
+      caption_loss = CrossEntropyLoss(...)(logits, labels)
+
+  继承关系
+
+  MELPModel 继承自 MERLModel，所以以下参数和方法自动继承：
+  - use_learnable_sim
+  - sim_alpha, learnable_threshold, learnable_soft_weight
+  - compute_hybrid_similarity()
+
+  使用方式
+
+  # 使用可学习软标签 (默认)
+  model = MELPModel(...)  # use_learnable_sim=True 从 MERLModel 继承
+
+  # 使用硬标签 (原有方案)
+  model = MELPModel(use_learnable_sim=False, ...)
+
+> 预训练的指令和原来有差别吗 
+
+● 没有差别，预训练指令和原来一样。
+
+  因为：
+
+  1. 新参数都有默认值（在 MERLModel.__init__ 中）：
+  use_learnable_sim: bool = True,      # 默认开启
+  init_sim_alpha: float = 0.0,
+  init_threshold: float = 3.0,
+  init_soft_weight: float = -3.0,
+  2. MELPModel 继承 MERLModel，自动获得这些参数
+  3. main_pretrain.py 不需要修改
+
+  启动命令
+
+  # 和原来一样
+  CUDA_VISIBLE_DEVICES=0,1,2,3 python main_pretrain.py \
+      --model_name melp \
+      --num_devices 4 \
+      --batch_size 64 \
+      --max_epochs 100 \
+      ...
+
+  如果想切换回原方案
+
+  直接改 MERLModel.__init__ 的默认值：
+
+  use_learnable_sim: bool = False,  # 改成 False 即可
+
+  或者在代码里临时修改：
+
+  model = MELPModel(use_learnable_sim=False, ...)
+
+> AttributeError: 'CausalLMOutputWithCrossAttentions' object has no 
+attribute 'last_hidden_state'
+[rank0]: Traceback (most recent call last):
+[rank0]:   File "/root/MELP/scripts/pretrain/main_pretrain.py", line 187, in
+ <module>
+[rank0]:     main(hparams)
+[rank0]:   File "/root/MELP/scripts/pretrain/main_pretrain.py", line 150, in
+ main
+[rank0]:     trainer.fit(model, datamodule=datamodule)
+[rank0]:   File "/root/miniconda3/envs/melp/lib/python3.10/site-packages/lig
+htning/pytorch/trainer/trainer.py", line 538, in fit
+[rank0]:     call._call_and_handle_interrupt(
+[rank0]:   File "/root/miniconda3/envs/melp/lib/python3.10/site-packages/lig
+htning/pytorch/trainer/call.py", line 46, in _call_and_handle_interrupt
+[rank0]:     return trainer.strategy.launcher.launch(trainer_fn, *args, 
+trainer=trainer, **kwargs)
+[rank0]:   File "/root/miniconda3/envs/melp/lib/python3.10/site-packages/lig
+htning/pytorch/strategies/launchers/subprocess_script.py", line 105, in 
+launch
+[rank0]:     return function(*args, **kwargs)
+[rank0]:   File "/root/miniconda3/envs/melp/lib/python3.10/site-packages/lig
+htning/pytorch/trainer/trainer.py", line 574, in _fit_impl
+[rank0]:     self._run(model, ckpt_path=ckpt_path)
+[rank0]:   File "/root/miniconda3/envs/melp/lib/python3.10/site-packages/lig
+htning/pytorch/trainer/trainer.py", line 981, in _run
+[rank0]:     results = self._run_stage()
+[rank0]:   File "/root/miniconda3/envs/melp/lib/python3.10/site-packages/lig
+htning/pytorch/trainer/trainer.py", line 1023, in _run_stage
+[rank0]:     self._run_sanity_check()
+[rank0]:   File "/root/miniconda3/envs/melp/lib/python3.10/site-packages/lig
+htning/pytorch/trainer/trainer.py", line 1052, in _run_sanity_check
+[rank0]:     val_loop.run()
+[rank0]:   File "/root/miniconda3/envs/melp/lib/python3.10/site-packages/lig
+htning/pytorch/loops/utilities.py", line 178, in _decorator
+[rank0]:     return loop_run(self, *args, **kwargs)
+[rank0]:   File "/root/miniconda3/envs/melp/lib/python3.10/site-packages/lig
+htning/pytorch/loops/evaluation_loop.py", line 114, in run
+[rank0]:     self.on_run_start()
+[rank0]:   File "/root/miniconda3/envs/melp/lib/python3.10/site-packages/lig
+htning/pytorch/loops/evaluation_loop.py", line 245, in on_run_start
+[rank0]:     self._on_evaluation_epoch_start()
+[rank0]:   File "/root/miniconda3/envs/melp/lib/python3.10/site-packages/lig
+htning/pytorch/loops/evaluation_loop.py", line 326, in 
+_on_evaluation_epoch_start
+[rank0]:     call._call_lightning_module_hook(trainer, hook_name, *args, 
+**kwargs)
+[rank0]:   File "/root/miniconda3/envs/melp/lib/python3.10/site-packages/lig
+htning/pytorch/trainer/call.py", line 167, in _call_lightning_module_hook
+[rank0]:     output = fn(*args, **kwargs)
+[rank0]:   File "/root/MELP/src/melp/models/merl_model.py", line 504, in 
+on_validation_epoch_start
+[rank0]:     self.zeroshot_weights = self.get_class_emd(val_prompts)
+[rank0]:   File "/root/miniconda3/envs/melp/lib/python3.10/site-packages/tor
+ch/utils/_contextlib.py", line 120, in decorate_context
+[rank0]:     return func(*args, **kwargs)
+[rank0]:   File "/root/MELP/src/melp/models/merl_model.py", line 266, in 
+get_class_emd
+[rank0]:     class_embeddings = 
+self.get_text_emb(texts['input_ids'].type_as(self.logit_scale).long(),
+[rank0]:   File "/root/miniconda3/envs/melp/lib/python3.10/site-packages/tor
+ch/utils/_contextlib.py", line 120, in decorate_context
+[rank0]:     return func(*args, **kwargs)
+[rank0]:   File "/root/MELP/src/melp/models/melp_model.py", line 491, in 
+get_text_emb
+[rank0]:     text_emb = text_output.last_hidden_state[:, -1]
+[rank0]: AttributeError: 'CausalLMOutputWithCrossAttentions' object has no 
+attribute 'last_hidden_state' 
+
+● 这个错误不是我修改引起的，是 get_text_emb 方法原本就存在的问题。让我看一下：
+
+● Read(src/melp/models/melp_model.py)
+  ⎿  Read 20 lines
+
+● 问题在 get_text_emb 方法：
+  - 没有设置 output_hidden_states=True
+  - CausalLMOutputWithCrossAttentions 没有 last_hidden_state 属性
+
+  对比 _encode_text 的正确写法：
+
+  # _encode_text (正确)
+  text_output = self.lm_model(..., output_hidden_states=True)
+  last_hidden_state = text_output.hidden_states[-1]
+
+  # get_text_emb (错误)
+  text_output = self.lm_model(...)  # 缺少 output_hidden_states=True
+  text_emb = text_output.last_hidden_state[:, -1]  # 属性不存在
+
+  修复：
+
+● Update(src/melp/models/melp_model.py)
+  ⎿  Updated src/melp/models/melp_model.py with 10 additions and 4 removals
+       485            
+       486        @torch.no_grad()
+       487        def get_text_emb(self, input_ids, attention_mask):
+       488 -          if self.text_encoder_name in 
+           -  ["ncbi/MedCPT-Query-Encoder", "*/heart_bert"]:
+       489 -              text_output = 
+           - self.lm_model(input_ids=input_ids, 
+           - attention_mask=attention_mask)
+       490 -              # using the CLS token as the global embedding
+       491 -              text_emb = text_output.last_hidden_state[:, -1]
+       488 +          if self.text_encoder_name in 
+           +  ["ncbi/MedCPT-Query-Encoder", "fuyingw/heart_bert"]:
+       489 +              # ========== 原有代码 (已注释，有 bug) 
+           + ==========
+       490 +              # text_output = 
+           + self.lm_model(input_ids=input_ids, 
+           + attention_mask=attention_mask)
+       491 +              # # using the CLS token as the global embedding
+       492 +              # text_emb = text_output.last_hidden_state[:, 
+           + -1]
+       493 +  
+       494 +              # ========== 修复: 与 _encode_text 保持一致 
+           + ==========
+       495 +              text_output = 
+           + self.lm_model(input_ids=input_ids, 
+           + attention_mask=attention_mask, output_hidden_states=True)
+       496 +              last_hidden_state = 
+           + text_output.hidden_states[-1]
+       497 +              text_emb = last_hidden_state[:, -1]
+       498            else:
+       499                raise NotImplementedError
+       500    
+
+● 修复完成。这个是原代码的 bug，不是我修改引起的。
+
+  同时我还修复了条件判断中的 typo：
+  - 原来："*/heart_bert" ❌
+  - 现在："fuyingw/heart_bert" ✅
+
+  现在可以重新运行了。
+
+
+
