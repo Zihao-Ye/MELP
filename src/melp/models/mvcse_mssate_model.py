@@ -38,9 +38,117 @@ from melp.models.base_pretrain_model import BasePretrainModel
 from melp.utils.openclip_loss import (
     ClipLoss, SoftClipLoss, LearnableSoftClipLoss,
     MultiScaleClipLoss, MultiScaleSemanticEnhancedClipLoss,
-    ComplementaryMultiScaleClipLoss
+    ComplementaryMultiScaleClipLoss, DifferentiatedMultiScaleClipLoss,
+    SymmetricMultiScaleClipLoss
 )
 from melp.paths import PROMPT_PATH, DATASET_LABELS_PATH
+
+
+class ScaleTextQueryModule(nn.Module):
+    """
+    尺度感知文本Query模块
+
+    使用可学习的Query通过Cross-Attention从文本序列中提取不同尺度的语义信息。
+    与ECG侧的AttentionalPooler对称设计。
+
+    Args:
+        text_dim: 文本编码器输出维度 (如BERT为768)
+        embed_dim: 输出特征维度
+        num_heads: Cross-Attention的头数
+    """
+
+    def __init__(
+        self,
+        text_dim: int = 768,
+        embed_dim: int = 256,
+        num_heads: int = 8,
+        dropout: float = 0.1
+    ):
+        super().__init__()
+        self.text_dim = text_dim
+        self.embed_dim = embed_dim
+
+        # 三个可学习的Query向量
+        self.wave_query = nn.Parameter(torch.randn(1, 1, text_dim) * 0.02)
+        self.beat_query = nn.Parameter(torch.randn(1, 1, text_dim) * 0.02)
+        self.rhythm_query = nn.Parameter(torch.randn(1, 1, text_dim) * 0.02)
+
+        # Cross-Attention层（共享，节省参数）
+        self.cross_attn = nn.MultiheadAttention(
+            embed_dim=text_dim,
+            num_heads=num_heads,
+            dropout=dropout,
+            batch_first=True
+        )
+
+        # 投影到embed_dim
+        self.wave_proj = nn.Sequential(
+            nn.Linear(text_dim, embed_dim),
+            nn.LayerNorm(embed_dim)
+        )
+        self.beat_proj = nn.Sequential(
+            nn.Linear(text_dim, embed_dim),
+            nn.LayerNorm(embed_dim)
+        )
+        self.rhythm_proj = nn.Sequential(
+            nn.Linear(text_dim, embed_dim),
+            nn.LayerNorm(embed_dim)
+        )
+
+    def forward(
+        self,
+        text_seq: torch.Tensor,
+        attention_mask: torch.Tensor = None
+    ) -> Dict[str, torch.Tensor]:
+        """
+        Args:
+            text_seq: (B, L, text_dim) 文本序列特征
+            attention_mask: (B, L) 注意力掩码，1表示有效，0表示padding
+
+        Returns:
+            Dict containing:
+            - wave: (B, embed_dim) 波形尺度文本特征
+            - beat: (B, embed_dim) 心拍尺度文本特征
+            - rhythm: (B, embed_dim) 节律尺度文本特征
+        """
+        B = text_seq.shape[0]
+
+        # 扩展query到batch维度
+        wave_q = self.wave_query.expand(B, -1, -1)    # (B, 1, text_dim)
+        beat_q = self.beat_query.expand(B, -1, -1)
+        rhythm_q = self.rhythm_query.expand(B, -1, -1)
+
+        # 处理attention_mask: MultiheadAttention的key_padding_mask
+        # True表示忽略该位置
+        if attention_mask is not None:
+            key_padding_mask = (attention_mask == 0)
+        else:
+            key_padding_mask = None
+
+        # Cross-Attention: Query attend to text sequence
+        wave_out, _ = self.cross_attn(
+            wave_q, text_seq, text_seq,
+            key_padding_mask=key_padding_mask
+        )
+        beat_out, _ = self.cross_attn(
+            beat_q, text_seq, text_seq,
+            key_padding_mask=key_padding_mask
+        )
+        rhythm_out, _ = self.cross_attn(
+            rhythm_q, text_seq, text_seq,
+            key_padding_mask=key_padding_mask
+        )
+
+        # (B, 1, text_dim) -> (B, text_dim) -> (B, embed_dim)
+        text_wave = self.wave_proj(wave_out.squeeze(1))
+        text_beat = self.beat_proj(beat_out.squeeze(1))
+        text_rhythm = self.rhythm_proj(rhythm_out.squeeze(1))
+
+        return {
+            'wave': text_wave,
+            'beat': text_beat,
+            'rhythm': text_rhythm
+        }
 
 
 class MVCSEMSSATEModel(BasePretrainModel):
@@ -263,19 +371,35 @@ class MVCSEMSSATEModel(BasePretrainModel):
         self.text_encoder_hidden_dim = text_encoder_hidden_dim
 
         if self.use_multiscale:
-            # 多尺度模式：文本投影到embed_dim，然后在MultiScaleClipLoss中分别投影
-            self.proj_t = nn.Sequential(
-                nn.Linear(text_encoder_hidden_dim, self.proj_hidden),
-                nn.GELU(),
-                nn.Linear(self.proj_hidden, self.ecg_out_dim),  # 投影到embed_dim
+            # ========== 对称多尺度模式 ==========
+            # 文本侧也使用Query机制提取不同尺度的语义信息
+            # 与ECG侧的AttentionalPooler对称设计
+
+            # 尺度感知文本Query模块
+            self.scale_text_query = ScaleTextQueryModule(
+                text_dim=text_encoder_hidden_dim,
+                embed_dim=self.proj_out,  # 直接投影到对齐空间
+                num_heads=8,
+                dropout=0.1
             )
 
-            # 初始化互补多尺度对比损失
-            self.multiscale_loss = ComplementaryMultiScaleClipLoss(
-                embed_dim=self.ecg_out_dim,
+            # ECG侧的投影头（从encoder输出投影到对齐空间）
+            self.ecg_wave_proj = nn.Sequential(
+                nn.Linear(self.ecg_out_dim, self.proj_out),
+                nn.LayerNorm(self.proj_out)
+            )
+            self.ecg_beat_proj = nn.Sequential(
+                nn.Linear(self.ecg_out_dim, self.proj_out),
+                nn.LayerNorm(self.proj_out)
+            )
+            self.ecg_rhythm_proj = nn.Sequential(
+                nn.Linear(self.ecg_out_dim, self.proj_out),
+                nn.LayerNorm(self.proj_out)
+            )
+
+            # 对称多尺度对比损失
+            self.multiscale_loss = SymmetricMultiScaleClipLoss(
                 proj_dim=self.proj_out,
-                # 正交约束权重（需要足够大才能对抗对比loss）
-                ortho_weight=0.1,
                 # 分布式参数
                 local_loss=True,
                 gather_with_grad=True,
@@ -349,36 +473,72 @@ class MVCSEMSSATEModel(BasePretrainModel):
             attention_mask: 注意力掩码
 
         Returns:
-            Dict containing:
+            多尺度模式:
+            - wave: (B, proj_out) 波形尺度文本特征
+            - beat: (B, proj_out) 心拍尺度文本特征
+            - rhythm: (B, proj_out) 节律尺度文本特征
+
+            单尺度模式:
             - proj_text_emb: 投影后的文本嵌入
             - text_emb: 原始LM嵌入
         """
-        if self.text_encoder_name == "ncbi/MedCPT-Query-Encoder":
-            text_emb = self.lm_model(
-                input_ids=input_ids,
-                attention_mask=attention_mask
-            ).pooler_output
+        if self.use_multiscale:
+            # ========== 多尺度模式：使用序列输出 + Query机制 ==========
+            if self.text_encoder_name == "ncbi/MedCPT-Query-Encoder":
+                # 获取序列输出而非pooler_output
+                lm_output = self.lm_model(
+                    input_ids=input_ids,
+                    attention_mask=attention_mask
+                )
+                text_seq = lm_output.last_hidden_state  # (B, L, 768)
 
-        elif self.text_encoder_name in ["google/flan-t5-small", "google/flan-t5-base"]:
-            sequence_output = self.lm_model(
-                input_ids=input_ids,
-                attention_mask=attention_mask
-            ).last_hidden_state
+            elif self.text_encoder_name in ["google/flan-t5-small", "google/flan-t5-base"]:
+                text_seq = self.lm_model(
+                    input_ids=input_ids,
+                    attention_mask=attention_mask
+                ).last_hidden_state  # (B, L, hidden_dim)
 
-            eos_mask = input_ids.eq(self.lm_model.config.eos_token_id).type_as(attention_mask).bool()
-            if len(torch.unique_consecutive(eos_mask.sum(1))) > 1:
-                raise ValueError("All examples must have the same number of <eos> tokens.")
+            else:
+                raise NotImplementedError(f"Unknown text encoder: {self.text_encoder_name}")
 
-            batch_size, _, hidden_size = sequence_output.shape
-            text_emb = sequence_output[eos_mask, :].view(batch_size, -1, hidden_size)[:, -1, :]
+            # 通过Scale Query提取三个尺度的文本特征
+            text_feats = self.scale_text_query(text_seq, attention_mask)
 
-        proj_text_emb = self.proj_t(text_emb)
-        proj_text_emb = F.normalize(proj_text_emb, dim=-1)
+            # L2归一化
+            return {
+                'wave': F.normalize(text_feats['wave'], dim=-1),
+                'beat': F.normalize(text_feats['beat'], dim=-1),
+                'rhythm': F.normalize(text_feats['rhythm'], dim=-1)
+            }
 
-        return {
-            'proj_text_emb': proj_text_emb,
-            'text_emb': text_emb
-        }
+        else:
+            # ========== 单尺度模式：原有逻辑 ==========
+            if self.text_encoder_name == "ncbi/MedCPT-Query-Encoder":
+                text_emb = self.lm_model(
+                    input_ids=input_ids,
+                    attention_mask=attention_mask
+                ).pooler_output
+
+            elif self.text_encoder_name in ["google/flan-t5-small", "google/flan-t5-base"]:
+                sequence_output = self.lm_model(
+                    input_ids=input_ids,
+                    attention_mask=attention_mask
+                ).last_hidden_state
+
+                eos_mask = input_ids.eq(self.lm_model.config.eos_token_id).type_as(attention_mask).bool()
+                if len(torch.unique_consecutive(eos_mask.sum(1))) > 1:
+                    raise ValueError("All examples must have the same number of <eos> tokens.")
+
+                batch_size, _, hidden_size = sequence_output.shape
+                text_emb = sequence_output[eos_mask, :].view(batch_size, -1, hidden_size)[:, -1, :]
+
+            proj_text_emb = self.proj_t(text_emb)
+            proj_text_emb = F.normalize(proj_text_emb, dim=-1)
+
+            return {
+                'proj_text_emb': proj_text_emb,
+                'text_emb': text_emb
+            }
 
     @torch.no_grad()
     def ext_ecg_emb(self, ecg: torch.Tensor, mode: str = 'concat') -> torch.Tensor:
@@ -393,14 +553,22 @@ class MVCSEMSSATEModel(BasePretrainModel):
             proj_ecg_emb: (B, 3*proj_out) for concat, (B, proj_out) for mean/rhythm
         """
         if self.use_multiscale:
-            # 多尺度模式：获取三个层级特征
+            # 多尺度模式：获取三个层级特征并投影
             ecg_feats = self.ecg_encoder.forward_multiscale(ecg)
-            proj_ecg_emb = self.multiscale_loss.get_ecg_embedding(
-                ecg_feats['wave'],
-                ecg_feats['beat'],
-                ecg_feats['rhythm'],
-                mode=mode
-            )
+
+            # 投影 + 归一化
+            wave_z = F.normalize(self.ecg_wave_proj(ecg_feats['wave']), dim=-1)
+            beat_z = F.normalize(self.ecg_beat_proj(ecg_feats['beat']), dim=-1)
+            rhythm_z = F.normalize(self.ecg_rhythm_proj(ecg_feats['rhythm']), dim=-1)
+
+            if mode == 'concat':
+                proj_ecg_emb = torch.cat([wave_z, beat_z, rhythm_z], dim=-1)
+            elif mode == 'mean':
+                proj_ecg_emb = (wave_z + beat_z + rhythm_z) / 3
+            elif mode == 'rhythm':
+                proj_ecg_emb = rhythm_z
+            else:
+                raise ValueError(f"Unknown mode: {mode}")
         else:
             # 单尺度模式
             ecg_emb = self.ecg_encoder(ecg)
@@ -411,30 +579,60 @@ class MVCSEMSSATEModel(BasePretrainModel):
     @torch.no_grad()
     def get_text_emb(self, input_ids: torch.Tensor, attention_mask: torch.Tensor, mode: str = 'concat') -> torch.Tensor:
         """获取文本嵌入（用于推理）"""
-        if self.text_encoder_name == "ncbi/MedCPT-Query-Encoder":
-            text_emb = self.lm_model(
-                input_ids=input_ids,
-                attention_mask=attention_mask
-            ).pooler_output
-
-        elif self.text_encoder_name in ["google/flan-t5-small", "google/flan-t5-base"]:
-            sequence_output = self.lm_model(
-                input_ids=input_ids,
-                attention_mask=attention_mask
-            ).last_hidden_state
-
-            eos_mask = input_ids.eq(self.lm_model.config.eos_token_id).type_as(attention_mask).bool()
-            if len(torch.unique_consecutive(eos_mask.sum(1))) > 1:
-                raise ValueError("All examples must have the same number of <eos> tokens.")
-
-            batch_size, _, hidden_size = sequence_output.shape
-            text_emb = sequence_output[eos_mask, :].view(batch_size, -1, hidden_size)[:, -1, :]
-
-        text_emb = self.proj_t(text_emb)
-
         if self.use_multiscale:
-            # 多尺度模式：通过MultiScaleClipLoss获取文本embedding
-            text_emb = self.multiscale_loss.get_text_embedding(text_emb, mode=mode)
+            # 多尺度模式：使用Scale Query提取三个尺度的文本特征
+            if self.text_encoder_name == "ncbi/MedCPT-Query-Encoder":
+                lm_output = self.lm_model(
+                    input_ids=input_ids,
+                    attention_mask=attention_mask
+                )
+                text_seq = lm_output.last_hidden_state
+
+            elif self.text_encoder_name in ["google/flan-t5-small", "google/flan-t5-base"]:
+                text_seq = self.lm_model(
+                    input_ids=input_ids,
+                    attention_mask=attention_mask
+                ).last_hidden_state
+
+            # 通过Scale Query提取三个尺度的特征
+            text_feats = self.scale_text_query(text_seq, attention_mask)
+
+            # 归一化
+            wave_z = F.normalize(text_feats['wave'], dim=-1)
+            beat_z = F.normalize(text_feats['beat'], dim=-1)
+            rhythm_z = F.normalize(text_feats['rhythm'], dim=-1)
+
+            if mode == 'concat':
+                text_emb = torch.cat([wave_z, beat_z, rhythm_z], dim=-1)
+            elif mode == 'mean':
+                text_emb = (wave_z + beat_z + rhythm_z) / 3
+            elif mode == 'rhythm':
+                text_emb = rhythm_z
+            else:
+                raise ValueError(f"Unknown mode: {mode}")
+
+        else:
+            # 单尺度模式
+            if self.text_encoder_name == "ncbi/MedCPT-Query-Encoder":
+                text_emb = self.lm_model(
+                    input_ids=input_ids,
+                    attention_mask=attention_mask
+                ).pooler_output
+
+            elif self.text_encoder_name in ["google/flan-t5-small", "google/flan-t5-base"]:
+                sequence_output = self.lm_model(
+                    input_ids=input_ids,
+                    attention_mask=attention_mask
+                ).last_hidden_state
+
+                eos_mask = input_ids.eq(self.lm_model.config.eos_token_id).type_as(attention_mask).bool()
+                if len(torch.unique_consecutive(eos_mask.sum(1))) > 1:
+                    raise ValueError("All examples must have the same number of <eos> tokens.")
+
+                batch_size, _, hidden_size = sequence_output.shape
+                text_emb = sequence_output[eos_mask, :].view(batch_size, -1, hidden_size)[:, -1, :]
+
+            text_emb = self.proj_t(text_emb)
 
         return text_emb
 
@@ -538,35 +736,46 @@ class MVCSEMSSATEModel(BasePretrainModel):
         text_output = self.encode_text(input_ids, attention_mask)
 
         if self.use_multiscale:
-            # ========== 互补多尺度对比学习 ==========
+            # ========== 对称多尺度对比学习 ==========
+            # ECG侧和文本侧都有尺度感知的Query机制
+
             # 更新分布式参数
             rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
             world_size = torch.distributed.get_world_size() if torch.distributed.is_initialized() else 1
             self.multiscale_loss.rank = rank
             self.multiscale_loss.world_size = world_size
-            self.multiscale_loss.clip_loss.rank = rank
-            self.multiscale_loss.clip_loss.world_size = world_size
 
-            # 计算互补多尺度loss
+            # ECG侧：投影 + L2归一化
+            ecg_wave = F.normalize(self.ecg_wave_proj(ecg_output['wave']), dim=-1)
+            ecg_beat = F.normalize(self.ecg_beat_proj(ecg_output['beat']), dim=-1)
+            ecg_rhythm = F.normalize(self.ecg_rhythm_proj(ecg_output['rhythm']), dim=-1)
+
+            # 文本侧：已在encode_text中完成投影和归一化
+            text_wave = text_output['wave']
+            text_beat = text_output['beat']
+            text_rhythm = text_output['rhythm']
+
+            # 计算对称多尺度loss
             loss_output = self.multiscale_loss(
-                wave_feat=ecg_output['wave'],
-                beat_feat=ecg_output['beat'],
-                rhythm_feat=ecg_output['rhythm'],
-                text_feat=text_output['proj_text_emb'],  # 已投影的文本特征
+                ecg_wave=ecg_wave,
+                ecg_beat=ecg_beat,
+                ecg_rhythm=ecg_rhythm,
+                text_wave=text_wave,
+                text_beat=text_beat,
+                text_rhythm=text_rhythm,
                 output_dict=True
             )
 
             loss_dict = {
                 'loss': loss_output['total_loss'],
                 'contrastive_loss': loss_output['contrastive_loss'],
-                'ortho_loss': loss_output['ortho_loss'],
                 'loss_wave': loss_output['loss_wave'],
                 'loss_beat': loss_output['loss_beat'],
                 'loss_rhythm': loss_output['loss_rhythm'],
-                # 正交程度监控（越小越好）
-                'cos_wave_beat': loss_output['cos_wave_beat'],
-                'cos_wave_rhythm': loss_output['cos_wave_rhythm'],
-                'cos_beat_rhythm': loss_output['cos_beat_rhythm'],
+                # temperature监控
+                'scale_wave': loss_output['scale_wave'],
+                'scale_beat': loss_output['scale_beat'],
+                'scale_rhythm': loss_output['scale_rhythm'],
             }
         else:
             # ========== 单尺度对比学习（原有逻辑）==========
