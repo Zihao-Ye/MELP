@@ -1,18 +1,25 @@
 """
 MVCSE-MSSATE 预训练脚本
 
-基于方案3.1和3.2的ECG-文本多模态预训练:
-- MVCSE: Multi-View Cardiac Spatial Encoding (解剖分组空间编码)
-- MS-SATE: Multi-Scale Shift-Adaptive Temporal Encoding (多尺度时序编码)
-- DiagSim-Weighted Loss: 诊断语义相似度加权对比学习损失
+支持两种架构:
+1. 单尺度架构 (mvcse_mssate_*): 原有Conv1d硬切分方案
+2. 多尺度层级架构 (hierarchical_mvcse_mssate_*): 可学习Query软切分方案
+   - wave/beat/rhythm三级特征建模
+   - 每个层级独立和文本对齐
+   - 使用MultiScaleClipLoss
 
 使用方法:
+# 单尺度架构（原有方案）
 CUDA_VISIBLE_DEVICES=0,1,2,3 python main_pretrain_mvcse_mssate.py \
     --num_devices 4 --train_data_pct 1 \
-    --text_encoder_name ncbi/MedCPT-Query-Encoder \
-    --lr 2e-4 --batch_size 64 --max_epochs 100 \
     --ecg_encoder_name mvcse_mssate_base \
-    --channel_attention se --use_relative_pos
+    --lr 2e-4 --batch_size 64 --max_epochs 100
+
+# 多尺度层级架构（新方案，推荐）
+CUDA_VISIBLE_DEVICES=0,1,2,3 python main_pretrain_mvcse_mssate.py \
+    --num_devices 4 --train_data_pct 1 \
+    --ecg_encoder_name hierarchical_mvcse_mssate_base \
+    --lr 2e-4 --batch_size 64 --max_epochs 100
 """
 
 import ipdb
@@ -114,8 +121,12 @@ def main(hparams: Namespace):
         ecg_encoder_name=hparams.ecg_encoder_name,
         embed_dim=hparams.embed_dim,
         seq_len=hparams.seq_len,
-        encoder_depth=hparams.encoder_depth,
-        num_heads=hparams.num_heads,
+        # 新架构参数（方案B）
+        lead_transformer_depth=hparams.lead_transformer_depth,
+        lead_transformer_heads=hparams.lead_transformer_heads,
+        cross_lead_depth=hparams.cross_lead_depth,
+        mssate_depth=hparams.mssate_depth,
+        mssate_num_heads=hparams.mssate_num_heads,
         channel_attention=hparams.channel_attention,
         use_relative_pos=hparams.use_relative_pos,
         # 文本编码器参数
@@ -153,7 +164,11 @@ if __name__ == '__main__':
     # 模型选择
     parser.add_argument("--ecg_encoder_name", type=str, default="mvcse_mssate_base",
                         choices=["mvcse_mssate_tiny", "mvcse_mssate_small",
-                                 "mvcse_mssate_base", "mvcse_mssate_large", "custom"])
+                                 "mvcse_mssate_base", "mvcse_mssate_large",
+                                 "hierarchical_mvcse_mssate_small",
+                                 "hierarchical_mvcse_mssate_base",
+                                 "hierarchical_mvcse_mssate_large",
+                                 "custom"])
     parser.add_argument("--text_encoder_name", type=str, default="ncbi/MedCPT-Query-Encoder",
                         choices=["ncbi/MedCPT-Query-Encoder",
                                  "google/flan-t5-small", "google/flan-t5-base"])
@@ -163,10 +178,19 @@ if __name__ == '__main__':
                         help="Embedding dimension for MVCSE")
     parser.add_argument("--seq_len", type=int, default=5000,
                         help="Input sequence length")
-    parser.add_argument("--encoder_depth", type=int, default=6,
-                        help="Number of transformer layers per scale")
-    parser.add_argument("--num_heads", type=int, default=8,
-                        help="Number of attention heads")
+
+    # 新架构参数（方案B）
+    parser.add_argument("--lead_transformer_depth", type=int, default=6,
+                        help="Number of lead-level transformer layers (per group)")
+    parser.add_argument("--lead_transformer_heads", type=int, default=4,
+                        help="Number of attention heads in lead transformer")
+    parser.add_argument("--cross_lead_depth", type=int, default=1,
+                        help="Number of cross-lead aggregation layers")
+    parser.add_argument("--mssate_depth", type=int, default=2,
+                        help="Number of MS-SATE transformer layers per scale")
+    parser.add_argument("--mssate_num_heads", type=int, default=8,
+                        help="Number of attention heads in MS-SATE")
+
     parser.add_argument("--channel_attention", type=str, default="se",
                         choices=["se", "eca", "none"],
                         help="Inter-group channel attention type")

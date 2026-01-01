@@ -28,8 +28,17 @@ from melp.backbone.mvcse_mssate_encoder import (
     mvcse_mssate_base,
     mvcse_mssate_large
 )
+from melp.backbone.mvcse_mssate import (
+    HierarchicalMVCSEMSSATEEncoder,
+    hierarchical_mvcse_mssate_small,
+    hierarchical_mvcse_mssate_base,
+    hierarchical_mvcse_mssate_large
+)
 from melp.models.base_pretrain_model import BasePretrainModel
-from melp.utils.openclip_loss import ClipLoss, SoftClipLoss, LearnableSoftClipLoss
+from melp.utils.openclip_loss import (
+    ClipLoss, SoftClipLoss, LearnableSoftClipLoss,
+    MultiScaleClipLoss, MultiScaleSemanticEnhancedClipLoss
+)
 from melp.paths import PROMPT_PATH, DATASET_LABELS_PATH
 
 
@@ -50,8 +59,12 @@ class MVCSEMSSATEModel(BasePretrainModel):
         ecg_encoder_name: str = "mvcse_mssate_base",
         embed_dim: int = 256,
         seq_len: int = 5000,
-        encoder_depth: int = 6,
-        num_heads: int = 8,
+        # 新架构参数（方案B）
+        lead_transformer_depth: int = 6,  # 导联级Transformer层数
+        lead_transformer_heads: int = 4,
+        cross_lead_depth: int = 1,        # Cross-Lead聚合层数
+        mssate_depth: int = 2,            # MS-SATE层数
+        mssate_num_heads: int = 8,
         channel_attention: str = 'se',
         use_relative_pos: bool = True,
         # 文本编码器参数
@@ -87,8 +100,12 @@ class MVCSEMSSATEModel(BasePretrainModel):
         self.ecg_encoder_name = ecg_encoder_name
         self.embed_dim = embed_dim
         self.seq_len = seq_len
-        self.encoder_depth = encoder_depth
-        self.num_heads = num_heads
+        # 新架构参数
+        self.lead_transformer_depth = lead_transformer_depth
+        self.lead_transformer_heads = lead_transformer_heads
+        self.cross_lead_depth = cross_lead_depth
+        self.mssate_depth = mssate_depth
+        self.mssate_num_heads = mssate_num_heads
         self.channel_attention = channel_attention
         self.use_relative_pos = use_relative_pos
 
@@ -132,64 +149,90 @@ class MVCSEMSSATEModel(BasePretrainModel):
 
     def init_ecg_encoder(self):
         """初始化MVCSE-MSSATE ECG编码器"""
-        # 根据名称选择模型大小
-        if self.ecg_encoder_name == 'mvcse_mssate_tiny':
-            self.ecg_encoder = mvcse_mssate_tiny(
-                seq_len=self.seq_len,
-                output_dim=self.proj_out,
-                channel_attention=self.channel_attention,
-                use_relative_pos=self.use_relative_pos
-            )
-        elif self.ecg_encoder_name == 'mvcse_mssate_small':
-            self.ecg_encoder = mvcse_mssate_small(
-                seq_len=self.seq_len,
-                output_dim=self.proj_out,
-                channel_attention=self.channel_attention,
-                use_relative_pos=self.use_relative_pos
-            )
-        elif self.ecg_encoder_name == 'mvcse_mssate_base':
-            self.ecg_encoder = mvcse_mssate_base(
-                seq_len=self.seq_len,
-                output_dim=self.proj_out,
-                channel_attention=self.channel_attention,
-                use_relative_pos=self.use_relative_pos
-            )
-        elif self.ecg_encoder_name == 'mvcse_mssate_large':
-            self.ecg_encoder = mvcse_mssate_large(
-                seq_len=self.seq_len,
-                output_dim=self.proj_out,
-                channel_attention=self.channel_attention,
-                use_relative_pos=self.use_relative_pos
-            )
+        # 判断是否使用多尺度层级encoder
+        self.use_multiscale = self.ecg_encoder_name.startswith('hierarchical_')
+
+        if self.use_multiscale:
+            # ========== 多尺度层级Encoder (wave/beat/rhythm) ==========
+            if self.ecg_encoder_name == 'hierarchical_mvcse_mssate_small':
+                self.ecg_encoder = hierarchical_mvcse_mssate_small(
+                    seq_len=self.seq_len,
+                    output_dim=self.embed_dim
+                )
+            elif self.ecg_encoder_name == 'hierarchical_mvcse_mssate_base':
+                self.ecg_encoder = hierarchical_mvcse_mssate_base(
+                    seq_len=self.seq_len,
+                    output_dim=self.embed_dim
+                )
+            elif self.ecg_encoder_name == 'hierarchical_mvcse_mssate_large':
+                self.ecg_encoder = hierarchical_mvcse_mssate_large(
+                    seq_len=self.seq_len,
+                    output_dim=self.embed_dim
+                )
+            else:
+                raise ValueError(f"Unknown hierarchical encoder: {self.ecg_encoder_name}")
+
+            # 多尺度encoder的输出维度
+            self.ecg_out_dim = self.ecg_encoder.embed_dim
+
+            # 不需要单独的proj_e，投影在MultiScaleClipLoss内部做
+
         else:
-            # 自定义配置
-            self.ecg_encoder = MVCSEMSSATEEncoder(
-                embed_dim=self.embed_dim,
-                seq_len=self.seq_len,
-                depth=self.encoder_depth,
-                num_heads=self.num_heads,
-                channel_attention=self.channel_attention,
-                use_relative_pos=self.use_relative_pos,
-                output_dim=self.proj_out
+            # ========== 原有的单尺度Encoder ==========
+            if self.ecg_encoder_name == 'mvcse_mssate_tiny':
+                self.ecg_encoder = mvcse_mssate_tiny(
+                    seq_len=self.seq_len,
+                    output_dim=self.proj_out,
+                    channel_attention=self.channel_attention,
+                    use_relative_pos=self.use_relative_pos
+                )
+            elif self.ecg_encoder_name == 'mvcse_mssate_small':
+                self.ecg_encoder = mvcse_mssate_small(
+                    seq_len=self.seq_len,
+                    output_dim=self.proj_out,
+                    channel_attention=self.channel_attention,
+                    use_relative_pos=self.use_relative_pos
+                )
+            elif self.ecg_encoder_name == 'mvcse_mssate_base':
+                self.ecg_encoder = mvcse_mssate_base(
+                    seq_len=self.seq_len,
+                    output_dim=self.proj_out,
+                    channel_attention=self.channel_attention,
+                    use_relative_pos=self.use_relative_pos
+                )
+            elif self.ecg_encoder_name == 'mvcse_mssate_large':
+                self.ecg_encoder = mvcse_mssate_large(
+                    seq_len=self.seq_len,
+                    output_dim=self.proj_out,
+                    channel_attention=self.channel_attention,
+                    use_relative_pos=self.use_relative_pos
+                )
+            else:
+                # 自定义配置
+                self.ecg_encoder = MVCSEMSSATEEncoder(
+                    embed_dim=self.embed_dim,
+                    seq_len=self.seq_len,
+                    lead_transformer_depth=self.lead_transformer_depth,
+                    lead_transformer_heads=self.lead_transformer_heads,
+                    cross_lead_depth=self.cross_lead_depth,
+                    mssate_depth=self.mssate_depth,
+                    mssate_num_heads=self.mssate_num_heads,
+                    channel_attention=self.channel_attention,
+                    use_relative_pos=self.use_relative_pos,
+                    output_dim=self.proj_out
+                )
+
+            # 获取ECG编码器输出维度
+            self.ecg_out_dim = self.ecg_encoder.output_dim
+
+            # ECG 投影层 (单尺度使用)
+            self.proj_e = nn.Sequential(
+                nn.Linear(self.ecg_out_dim, self.proj_hidden),
+                nn.BatchNorm1d(self.proj_hidden),
+                nn.ReLU(inplace=True),
+                nn.Linear(self.proj_hidden, self.proj_out),
+                nn.BatchNorm1d(self.proj_out),
             )
-
-        # 获取ECG编码器输出维度
-        self.ecg_out_dim = self.ecg_encoder.output_dim
-
-        # ECG 投影层 (与 MERL ViT 分支一致，与文本侧 proj_t 对称)
-        self.proj_e = nn.Sequential(
-            nn.Linear(self.ecg_out_dim, self.proj_hidden),
-            nn.BatchNorm1d(self.proj_hidden),
-            nn.ReLU(inplace=True),
-            nn.Linear(self.proj_hidden, self.proj_out),
-            nn.BatchNorm1d(self.proj_out),
-        )
-
-        # UMA (Unimodal Alignment) 的双投影层
-        self.linear1 = nn.Linear(self.ecg_out_dim, self.proj_out, bias=False)
-        self.linear2 = nn.Linear(self.ecg_out_dim, self.proj_out, bias=False)
-        self.dropout1 = nn.Dropout(p=0.1)
-        self.dropout2 = nn.Dropout(p=0.1)
 
     def init_text_encoder(self):
         """初始化文本编码器（与MERL保持一致）"""
@@ -216,12 +259,41 @@ class MVCSEMSSATEModel(BasePretrainModel):
         else:
             raise NotImplementedError(f"Unknown text encoder: {self.text_encoder_name}")
 
-        # 文本投影层
-        self.proj_t = nn.Sequential(
-            nn.Linear(text_encoder_hidden_dim, self.proj_hidden),
-            nn.GELU(),
-            nn.Linear(self.proj_hidden, self.proj_out),
-        )
+        self.text_encoder_hidden_dim = text_encoder_hidden_dim
+
+        if self.use_multiscale:
+            # 多尺度模式：文本投影到embed_dim，然后在MultiScaleClipLoss中分别投影
+            self.proj_t = nn.Sequential(
+                nn.Linear(text_encoder_hidden_dim, self.proj_hidden),
+                nn.GELU(),
+                nn.Linear(self.proj_hidden, self.ecg_out_dim),  # 投影到embed_dim
+            )
+
+            # 初始化多尺度语义增强对比损失
+            self.multiscale_loss = MultiScaleSemanticEnhancedClipLoss(
+                embed_dim=self.ecg_out_dim,
+                proj_dim=self.proj_out,
+                # 各尺度软标签参数初始值
+                init_threshold_wave=3.0,      # sigmoid后 ≈ 0.95
+                init_threshold_beat=3.0,
+                init_threshold_rhythm=3.0,
+                init_soft_weight_wave=-3.0,   # sigmoid后 ≈ 0.05
+                init_soft_weight_beat=-3.0,
+                init_soft_weight_rhythm=-3.0,
+                # 分布式参数
+                local_loss=True,
+                gather_with_grad=True,
+                cache_labels=True,
+                rank=0,  # 会在training_step中更新
+                world_size=1,  # 会在training_step中更新
+            )
+        else:
+            # 单尺度模式：原有投影
+            self.proj_t = nn.Sequential(
+                nn.Linear(text_encoder_hidden_dim, self.proj_hidden),
+                nn.GELU(),
+                nn.Linear(self.proj_hidden, self.proj_out),
+            )
 
         self.tokenizer = AutoTokenizer.from_pretrained(self.text_encoder_name)
 
@@ -245,27 +317,32 @@ class MVCSEMSSATEModel(BasePretrainModel):
             ecg: (B, 12, L) - 12导联ECG信号
 
         Returns:
-            Dict containing:
-            - proj_ecg_emb: 投影后的ECG嵌入 (用于CMA)
-            - ecg_emb1, ecg_emb2: UMA的双视图嵌入
+            多尺度模式:
+            - wave: (B, D) 波段级特征
+            - beat: (B, D) 心拍级特征
+            - rhythm: (B, D) 节律级特征
+
+            单尺度模式:
+            - proj_ecg_emb: 投影后的ECG嵌入
+            - ecg_emb: 原始嵌入
         """
-        # 通过MVCSE-MSSATE编码器
-        ecg_emb = self.ecg_encoder(ecg)  # (B, output_dim)
-
-        # 通过投影层 (与 MERL ViT 分支一致)
-        proj_ecg_emb = self.proj_e(ecg_emb)  # (B, proj_out)
-        proj_ecg_emb = F.normalize(proj_ecg_emb, dim=-1)
-
-        # UMA的双投影
-        ecg_emb1 = self.dropout1(self.linear1(ecg_emb))
-        ecg_emb2 = self.dropout2(self.linear2(ecg_emb))
-
-        return {
-            'proj_ecg_emb': proj_ecg_emb,
-            'ecg_emb1': ecg_emb1,
-            'ecg_emb2': ecg_emb2,
-            'ecg_emb': ecg_emb  # 原始嵌入
-        }
+        if self.use_multiscale:
+            # 多尺度模式：返回三个层级的特征
+            ecg_feats = self.ecg_encoder.forward_multiscale(ecg)
+            return {
+                'wave': ecg_feats['wave'],      # (B, D)
+                'beat': ecg_feats['beat'],      # (B, D)
+                'rhythm': ecg_feats['rhythm']   # (B, D)
+            }
+        else:
+            # 单尺度模式：原有逻辑
+            ecg_emb = self.ecg_encoder(ecg)  # (B, output_dim)
+            proj_ecg_emb = self.proj_e(ecg_emb)  # (B, proj_out)
+            proj_ecg_emb = F.normalize(proj_ecg_emb, dim=-1)
+            return {
+                'proj_ecg_emb': proj_ecg_emb,
+                'ecg_emb': ecg_emb
+            }
 
     def encode_text(self, input_ids: torch.Tensor, attention_mask: torch.Tensor) -> Dict[str, torch.Tensor]:
         """
@@ -308,23 +385,35 @@ class MVCSEMSSATEModel(BasePretrainModel):
         }
 
     @torch.no_grad()
-    def ext_ecg_emb(self, ecg: torch.Tensor) -> torch.Tensor:
+    def ext_ecg_emb(self, ecg: torch.Tensor, mode: str = 'concat') -> torch.Tensor:
         """
         提取ECG嵌入（用于推理）
 
         Args:
             ecg: (B, 12, L)
+            mode: 多尺度模式下的融合方式 ('concat', 'mean', 'rhythm')
 
         Returns:
-            proj_ecg_emb: (B, proj_out)
+            proj_ecg_emb: (B, 3*proj_out) for concat, (B, proj_out) for mean/rhythm
         """
-        ecg_emb = self.ecg_encoder(ecg)
-        proj_ecg_emb = self.proj_e(ecg_emb)
-        proj_ecg_emb = F.normalize(proj_ecg_emb, dim=-1)
+        if self.use_multiscale:
+            # 多尺度模式：获取三个层级特征
+            ecg_feats = self.ecg_encoder.forward_multiscale(ecg)
+            proj_ecg_emb = self.multiscale_loss.get_ecg_embedding(
+                ecg_feats['wave'],
+                ecg_feats['beat'],
+                ecg_feats['rhythm'],
+                mode=mode
+            )
+        else:
+            # 单尺度模式
+            ecg_emb = self.ecg_encoder(ecg)
+            proj_ecg_emb = self.proj_e(ecg_emb)
+            proj_ecg_emb = F.normalize(proj_ecg_emb, dim=-1)
         return proj_ecg_emb
 
     @torch.no_grad()
-    def get_text_emb(self, input_ids: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
+    def get_text_emb(self, input_ids: torch.Tensor, attention_mask: torch.Tensor, mode: str = 'concat') -> torch.Tensor:
         """获取文本嵌入（用于推理）"""
         if self.text_encoder_name == "ncbi/MedCPT-Query-Encoder":
             text_emb = self.lm_model(
@@ -346,6 +435,11 @@ class MVCSEMSSATEModel(BasePretrainModel):
             text_emb = sequence_output[eos_mask, :].view(batch_size, -1, hidden_size)[:, -1, :]
 
         text_emb = self.proj_t(text_emb)
+
+        if self.use_multiscale:
+            # 多尺度模式：通过MultiScaleClipLoss获取文本embedding
+            text_emb = self.multiscale_loss.get_text_embedding(text_emb, mode=mode)
+
         return text_emb
 
     @torch.no_grad()
@@ -447,85 +541,61 @@ class MVCSEMSSATEModel(BasePretrainModel):
         attention_mask = tokenized_input['attention_mask'].type_as(batch['ecg']).long()
         text_output = self.encode_text(input_ids, attention_mask)
 
-        # 标准CLIP损失函数
-        loss_fn = ClipLoss(
-            local_loss=True,
-            gather_with_grad=True,
-            cache_labels=True,
-            rank=torch.distributed.get_rank() if torch.distributed.is_initialized() else 0,
-            world_size=torch.distributed.get_world_size() if torch.distributed.is_initialized() else 1,
-            use_horovod=False
-        )
+        if self.use_multiscale:
+            # ========== 多尺度语义增强对比学习 ==========
+            # 更新分布式参数
+            rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+            world_size = torch.distributed.get_world_size() if torch.distributed.is_initialized() else 1
+            self.multiscale_loss.rank = rank
+            self.multiscale_loss.world_size = world_size
+            self.multiscale_loss.clip_loss.rank = rank
+            self.multiscale_loss.clip_loss.world_size = world_size
 
-        # ========== 使用原始 ClipLoss ==========
-        cma_loss = loss_fn(
-            ecg_output['proj_ecg_emb'],
-            text_output['proj_text_emb'],
-            self.logit_scale.exp()
-        )
+            # 计算多尺度语义增强loss
+            loss_output = self.multiscale_loss(
+                wave_feat=ecg_output['wave'],
+                beat_feat=ecg_output['beat'],
+                rhythm_feat=ecg_output['rhythm'],
+                text_feat=text_output['proj_text_emb'],  # 已投影的文本特征
+                text_emb=text_output['text_emb'],        # 原始文本嵌入（用于计算语义相似度）
+                output_dict=True
+            )
 
-        # # ========== 可学习软标签损失 (已注释) ==========
-        # if self.use_learnable_sim:
-        #     hybrid_sim, alpha = self.compute_hybrid_similarity(
-        #         text_output['proj_text_emb'],
-        #         text_output['text_emb']
-        #     )
-        #
-        #     learnable_soft_loss_fn = LearnableSoftClipLoss(
-        #         local_loss=True,
-        #         gather_with_grad=True,
-        #         rank=torch.distributed.get_rank() if torch.distributed.is_initialized() else 0,
-        #         world_size=torch.distributed.get_world_size() if torch.distributed.is_initialized() else 1,
-        #         use_horovod=False
-        #     )
-        #
-        #     soft_cma_loss = learnable_soft_loss_fn(
-        #         image_features=ecg_output['proj_ecg_emb'],
-        #         text_features=text_output['proj_text_emb'],
-        #         logit_scale=self.logit_scale.exp(),
-        #         sim_matrix=hybrid_sim,
-        #         threshold=self.learnable_threshold,
-        #         soft_weight=self.learnable_soft_weight,
-        #     )
-        # else:
-        #     text_sim_matrix = self.compute_text_similarity(batch['report'])
-        #
-        #     soft_clip_loss_fn = SoftClipLoss(
-        #         similarity_threshold=0.95,
-        #         soft_positive_weight=0.05,
-        #         local_loss=True,
-        #         gather_with_grad=True,
-        #         cache_labels=False,
-        #         rank=torch.distributed.get_rank() if torch.distributed.is_initialized() else 0,
-        #         world_size=torch.distributed.get_world_size() if torch.distributed.is_initialized() else 1,
-        #         use_horovod=False
-        #     )
-        #
-        #     soft_cma_loss = soft_clip_loss_fn(
-        #         image_features=ecg_output['proj_ecg_emb'],
-        #         text_features=text_output['proj_text_emb'],
-        #         logit_scale=self.logit_scale.exp(),
-        #         text_sim_matrix=text_sim_matrix
-        #     )
+            loss_dict = {
+                'loss': loss_output['contrastive_loss'],
+                'cma_loss': loss_output['contrastive_loss'],
+                'loss_wave': loss_output['loss_wave'],
+                'loss_beat': loss_output['loss_beat'],
+                'loss_rhythm': loss_output['loss_rhythm'],
+                # 可学习参数监控
+                'threshold_wave': loss_output['threshold_wave'],
+                'threshold_beat': loss_output['threshold_beat'],
+                'threshold_rhythm': loss_output['threshold_rhythm'],
+                'soft_weight_wave': loss_output['soft_weight_wave'],
+                'soft_weight_beat': loss_output['soft_weight_beat'],
+                'soft_weight_rhythm': loss_output['soft_weight_rhythm'],
+            }
+        else:
+            # ========== 单尺度对比学习（原有逻辑）==========
+            loss_fn = ClipLoss(
+                local_loss=True,
+                gather_with_grad=True,
+                cache_labels=True,
+                rank=torch.distributed.get_rank() if torch.distributed.is_initialized() else 0,
+                world_size=torch.distributed.get_world_size() if torch.distributed.is_initialized() else 1,
+                use_horovod=False
+            )
 
-        # UMA损失
-        uma_loss = loss_fn(
-            ecg_output['ecg_emb1'],
-            ecg_output['ecg_emb2'],
-            torch.tensor(1 / 0.07)
-        )
+            cma_loss = loss_fn(
+                ecg_output['proj_ecg_emb'],
+                text_output['proj_text_emb'],
+                self.logit_scale.exp()
+            )
 
-        loss_dict = {
-            'loss': cma_loss + uma_loss,
-            'cma_loss': cma_loss,
-            'uma_loss': uma_loss
-        }
-
-        # # 记录可学习参数的当前值 (用于监控训练过程)
-        # if self.use_learnable_sim:
-        #     loss_dict['sim_alpha'] = alpha.detach()
-        #     loss_dict['threshold'] = torch.sigmoid(self.learnable_threshold).detach()
-        #     loss_dict['soft_weight'] = torch.sigmoid(self.learnable_soft_weight).detach()
+            loss_dict = {
+                'loss': cma_loss,
+                'cma_loss': cma_loss,
+            }
 
         metrics_dict = {}
         return loss_dict, metrics_dict

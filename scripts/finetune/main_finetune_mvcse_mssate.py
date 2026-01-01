@@ -3,6 +3,12 @@ MVCSE-MSSATE 微调脚本
 
 基于预训练的MVCSE-MSSATE模型进行下游任务微调。
 
+支持两种模型架构:
+1. 单尺度架构 (mvcse_mssate_*): 原有Conv1d硬切分方案
+2. 多尺度层级架构 (hierarchical_mvcse_mssate_*): 可学习Query软切分方案
+   - 自动检测checkpoint中的模型类型
+   - 多尺度模型推理时自动融合三个尺度的特征
+
 支持两种微调模式:
 1. Linear Probing: 冻结backbone，只训练分类头
 2. Full Fine-tuning: 微调整个模型（可选小学习率更新backbone）
@@ -130,8 +136,11 @@ def main(hparams: Namespace):
             shared_emb_dim=hparams.shared_emb_dim,
         )
 
-    # 获取特征维度
-    hparams.in_features = pretrain_model.proj_out
+    # 获取特征维度（多尺度模型concat三个尺度，维度为3*proj_out）
+    if pretrain_model.use_multiscale:
+        hparams.in_features = 3 * pretrain_model.proj_out  # 768
+    else:
+        hparams.in_features = pretrain_model.proj_out  # 256
 
     pprint(vars(hparams))
 
@@ -286,6 +295,11 @@ if __name__ == '__main__':
 
     # 模型参数
     parser.add_argument("--ecg_encoder_name", type=str, default="mvcse_mssate_base",
+                        choices=["mvcse_mssate_tiny", "mvcse_mssate_small",
+                                 "mvcse_mssate_base", "mvcse_mssate_large",
+                                 "hierarchical_mvcse_mssate_small",
+                                 "hierarchical_mvcse_mssate_base",
+                                 "hierarchical_mvcse_mssate_large"],
                         help="ECG encoder name (used when no ckpt_path provided)")
     parser.add_argument("--text_encoder_name", type=str, default="ncbi/MedCPT-Query-Encoder",
                         help="Text encoder name (used when no ckpt_path provided)")

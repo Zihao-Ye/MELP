@@ -721,6 +721,719 @@ def neighbour_exchange_bidir_with_grad(left_rank, right_rank, tensor_to_left, te
     return NeighbourExchangeBidir.apply(left_rank, right_rank, group, tensor_to_left, tensor_to_right)
 
 
+class MultiScaleClipLoss(nn.Module):
+    """
+    多尺度对比学习损失
+
+    对ECG的三个层级(wave/beat/rhythm)分别和文本对齐，
+    每个层级有独立的投影空间，避免相互干扰。
+
+    Args:
+        embed_dim: ECG/Text encoder输出维度
+        proj_dim: 投影后的对齐空间维度
+        local_loss: 是否使用local loss
+        gather_with_grad: 是否在gather时保留梯度
+        rank: 当前GPU rank
+        world_size: GPU总数
+    """
+
+    def __init__(
+            self,
+            embed_dim: int = 256,
+            proj_dim: int = 256,
+            local_loss: bool = True,
+            gather_with_grad: bool = True,
+            cache_labels: bool = True,
+            rank: int = 0,
+            world_size: int = 1,
+            use_horovod: bool = False,
+    ):
+        super().__init__()
+        self.embed_dim = embed_dim
+        self.proj_dim = proj_dim
+
+        # ECG侧投影头：每个尺度独立
+        self.wave_proj = nn.Sequential(
+            nn.Linear(embed_dim, proj_dim),
+            nn.LayerNorm(proj_dim)
+        )
+        self.beat_proj = nn.Sequential(
+            nn.Linear(embed_dim, proj_dim),
+            nn.LayerNorm(proj_dim)
+        )
+        self.rhythm_proj = nn.Sequential(
+            nn.Linear(embed_dim, proj_dim),
+            nn.LayerNorm(proj_dim)
+        )
+
+        # Text侧投影头：对应三个尺度
+        self.text_wave_proj = nn.Sequential(
+            nn.Linear(embed_dim, proj_dim),
+            nn.LayerNorm(proj_dim)
+        )
+        self.text_beat_proj = nn.Sequential(
+            nn.Linear(embed_dim, proj_dim),
+            nn.LayerNorm(proj_dim)
+        )
+        self.text_rhythm_proj = nn.Sequential(
+            nn.Linear(embed_dim, proj_dim),
+            nn.LayerNorm(proj_dim)
+        )
+
+        # 可学习的temperature
+        self.logit_scale = nn.Parameter(torch.ones([]) * np.log(1 / 0.07))
+
+        # 复用ClipLoss的底层实现
+        self.clip_loss = ClipLoss(
+            local_loss=local_loss,
+            gather_with_grad=gather_with_grad,
+            cache_labels=cache_labels,
+            rank=rank,
+            world_size=world_size,
+            use_horovod=use_horovod,
+        )
+
+    def forward(
+            self,
+            wave_feat: torch.Tensor,
+            beat_feat: torch.Tensor,
+            rhythm_feat: torch.Tensor,
+            text_feat: torch.Tensor,
+            output_dict: bool = False
+    ):
+        """
+        Args:
+            wave_feat: (B, D) 波段级特征 (已池化)
+            beat_feat: (B, D) 心拍级特征 (已池化)
+            rhythm_feat: (B, D) 节律级特征 (已池化)
+            text_feat: (B, D) 文本特征
+
+        Returns:
+            total_loss 或 dict包含各层级loss
+        """
+        logit_scale = self.logit_scale.exp()
+
+        # ECG投影 + L2归一化
+        wave_z = F.normalize(self.wave_proj(wave_feat), dim=-1)
+        beat_z = F.normalize(self.beat_proj(beat_feat), dim=-1)
+        rhythm_z = F.normalize(self.rhythm_proj(rhythm_feat), dim=-1)
+
+        # Text投影 + L2归一化
+        text_wave_z = F.normalize(self.text_wave_proj(text_feat), dim=-1)
+        text_beat_z = F.normalize(self.text_beat_proj(text_feat), dim=-1)
+        text_rhythm_z = F.normalize(self.text_rhythm_proj(text_feat), dim=-1)
+
+        # 三个独立的对比loss
+        loss_wave = self.clip_loss(wave_z, text_wave_z, logit_scale)
+        loss_beat = self.clip_loss(beat_z, text_beat_z, logit_scale)
+        loss_rhythm = self.clip_loss(rhythm_z, text_rhythm_z, logit_scale)
+
+        total_loss = loss_wave + loss_beat + loss_rhythm
+
+        if output_dict:
+            return {
+                "contrastive_loss": total_loss,
+                "loss_wave": loss_wave,
+                "loss_beat": loss_beat,
+                "loss_rhythm": loss_rhythm,
+            }
+        return total_loss
+
+    def get_ecg_embedding(
+            self,
+            wave_feat: torch.Tensor,
+            beat_feat: torch.Tensor,
+            rhythm_feat: torch.Tensor,
+            mode: str = 'concat'
+    ) -> torch.Tensor:
+        """
+        推理时获取ECG的最终表示
+
+        Args:
+            wave_feat, beat_feat, rhythm_feat: (B, D) 各层级特征
+            mode: 'concat' 拼接, 'mean' 平均, 'rhythm' 只用rhythm
+
+        Returns:
+            (B, proj_dim) 或 (B, 3*proj_dim) 取决于mode
+        """
+        wave_z = F.normalize(self.wave_proj(wave_feat), dim=-1)
+        beat_z = F.normalize(self.beat_proj(beat_feat), dim=-1)
+        rhythm_z = F.normalize(self.rhythm_proj(rhythm_feat), dim=-1)
+
+        if mode == 'concat':
+            return torch.cat([wave_z, beat_z, rhythm_z], dim=-1)  # (B, 3D)
+        elif mode == 'mean':
+            return (wave_z + beat_z + rhythm_z) / 3  # (B, D)
+        elif mode == 'rhythm':
+            return rhythm_z  # (B, D)
+        else:
+            raise ValueError(f"Unknown mode: {mode}")
+
+    def get_text_embedding(
+            self,
+            text_feat: torch.Tensor,
+            mode: str = 'concat'
+    ) -> torch.Tensor:
+        """
+        推理时获取Text的最终表示（需要和get_ecg_embedding的mode对应）
+        """
+        text_wave_z = F.normalize(self.text_wave_proj(text_feat), dim=-1)
+        text_beat_z = F.normalize(self.text_beat_proj(text_feat), dim=-1)
+        text_rhythm_z = F.normalize(self.text_rhythm_proj(text_feat), dim=-1)
+
+        if mode == 'concat':
+            return torch.cat([text_wave_z, text_beat_z, text_rhythm_z], dim=-1)
+        elif mode == 'mean':
+            return (text_wave_z + text_beat_z + text_rhythm_z) / 3
+        elif mode == 'rhythm':
+            return text_rhythm_z
+        else:
+            raise ValueError(f"Unknown mode: {mode}")
+
+
+class SemanticEnhancedClipLoss(nn.Module):
+    """
+    语义增强的对比学习损失
+
+    特点：
+    1. 使用detach后的文本嵌入计算batch内语义相似度
+    2. 基于语义相似度构建软标签，降低高相似负样本的惩罚
+    3. 支持可学习的阈值和权重参数
+    4. 软标签构建使用可微分的sigmoid gate
+
+    软标签策略：
+    - 硬正样本（对角线）：权重 = 1.0
+    - 软正样本（sim > threshold）：权重 = soft_weight * sim
+    - 负样本：权重 = 0.0
+    """
+
+    def __init__(
+        self,
+        # 可学习参数初始值
+        init_threshold: float = 3.0,       # sigmoid后 ≈ 0.95
+        init_soft_weight: float = -3.0,    # sigmoid后 ≈ 0.05
+        # 分布式参数
+        local_loss: bool = True,
+        gather_with_grad: bool = True,
+        cache_labels: bool = True,
+        rank: int = 0,
+        world_size: int = 1,
+        use_horovod: bool = False,
+    ):
+        super().__init__()
+        self.local_loss = local_loss
+        self.gather_with_grad = gather_with_grad
+        self.cache_labels = cache_labels
+        self.rank = rank
+        self.world_size = world_size
+        self.use_horovod = use_horovod
+
+        # 可学习参数
+        self.learnable_threshold = nn.Parameter(torch.tensor(init_threshold))
+        self.learnable_soft_weight = nn.Parameter(torch.tensor(init_soft_weight))
+
+        # 可学习的temperature
+        self.logit_scale = nn.Parameter(torch.ones([]) * np.log(1 / 0.07))
+
+    def compute_semantic_similarity(self, text_emb: torch.Tensor) -> torch.Tensor:
+        """
+        计算batch内语义相似度矩阵（使用detach保证稳定性）
+
+        Args:
+            text_emb: (B, D) 文本嵌入（来自文本编码器，投影前）
+
+        Returns:
+            sim_matrix: (B, B) 相似度矩阵，值域[-1, 1]
+        """
+        with torch.no_grad():
+            text_emb_detached = text_emb.detach()
+            text_emb_norm = F.normalize(text_emb_detached, dim=-1)
+            sim_matrix = text_emb_norm @ text_emb_norm.T
+        return sim_matrix
+
+    def gather_sim_matrix(self, sim_matrix: torch.Tensor) -> torch.Tensor:
+        """
+        Gather语义相似度矩阵
+
+        Args:
+            sim_matrix: (local_B, local_B) 本地相似度矩阵
+
+        Returns:
+            gathered_sim: (local_B, global_B) for local_loss
+        """
+        if self.world_size == 1:
+            return sim_matrix
+
+        assert has_distributed, 'torch.distributed did not import correctly'
+
+        # Gather along column dimension
+        gathered_sim = [torch.zeros_like(sim_matrix) for _ in range(self.world_size)]
+        dist.all_gather(gathered_sim, sim_matrix)
+
+        # Concatenate: [local_B, global_B]
+        all_sim = torch.cat(gathered_sim, dim=1)
+
+        if not self.local_loss:
+            # Global loss: also gather along row dimension
+            gathered_rows = [torch.zeros_like(all_sim) for _ in range(self.world_size)]
+            dist.all_gather(gathered_rows, all_sim)
+            all_sim = torch.cat(gathered_rows, dim=0)
+
+        return all_sim
+
+    def build_soft_labels(
+        self,
+        sim_matrix: torch.Tensor,
+        num_logits: int,
+        threshold: torch.Tensor,
+        soft_weight: torch.Tensor
+    ) -> torch.Tensor:
+        """
+        基于语义相似度构建软标签（可微分版本）
+
+        Args:
+            sim_matrix: (local_B, global_B) 语义相似度矩阵
+            num_logits: local batch size
+            threshold: 可学习阈值（已sigmoid）
+            soft_weight: 可学习软权重（已sigmoid）
+
+        Returns:
+            soft_labels: (local_B, global_B)
+        """
+        device = sim_matrix.device
+        num_queries, num_classes = sim_matrix.shape
+
+        # 硬正样本位置（对角线）
+        row_indices = torch.arange(num_queries, device=device)
+        if self.world_size > 1 and self.local_loss:
+            col_indices = row_indices + num_logits * self.rank
+        else:
+            col_indices = row_indices
+        col_indices = torch.clamp(col_indices, 0, num_classes - 1)
+
+        # 硬正样本掩码
+        hard_positive_mask = torch.zeros(num_queries, num_classes, device=device)
+        hard_positive_mask[row_indices, col_indices] = 1.0
+
+        # 软正样本：使用sigmoid实现可微分的阈值判断
+        temperature = 10.0  # 控制sigmoid的陡峭程度
+        soft_gate = torch.sigmoid(temperature * (sim_matrix - threshold))
+
+        # 软正样本权重 = gate * soft_weight * similarity
+        # 排除硬正样本位置
+        soft_positive_weights = soft_gate * soft_weight * sim_matrix * (1 - hard_positive_mask)
+
+        # 最终软标签 = 硬正样本 + 软正样本
+        soft_labels = hard_positive_mask + soft_positive_weights
+
+        return soft_labels
+
+    def soft_cross_entropy(self, logits: torch.Tensor, soft_labels: torch.Tensor) -> torch.Tensor:
+        """
+        计算软交叉熵损失
+        """
+        log_probs = F.log_softmax(logits, dim=1)
+        # 归一化软标签
+        soft_targets = soft_labels / (soft_labels.sum(dim=1, keepdim=True) + 1e-8)
+        loss = -(soft_targets * log_probs).sum(dim=1).mean()
+        return loss
+
+    def get_logits(self, ecg_features, text_features, logit_scale):
+        """计算logits（支持多GPU）"""
+        if self.world_size > 1:
+            all_ecg_features, all_text_features = gather_features(
+                ecg_features,
+                text_features,
+                local_loss=self.local_loss,
+                gather_with_grad=self.gather_with_grad,
+                rank=self.rank,
+                world_size=self.world_size,
+                use_horovod=self.use_horovod,
+            )
+
+            if self.local_loss:
+                logits_per_ecg = logit_scale * ecg_features @ all_text_features.T
+                logits_per_text = logit_scale * text_features @ all_ecg_features.T
+            else:
+                logits_per_ecg = logit_scale * all_ecg_features @ all_text_features.T
+                logits_per_text = logits_per_ecg.T
+        else:
+            logits_per_ecg = logit_scale * ecg_features @ text_features.T
+            logits_per_text = logit_scale * text_features @ ecg_features.T
+
+        return logits_per_ecg, logits_per_text
+
+    def forward(
+        self,
+        ecg_features: torch.Tensor,
+        text_features: torch.Tensor,
+        text_emb: torch.Tensor,
+        logit_scale: Optional[torch.Tensor] = None,
+        output_dict: bool = False
+    ):
+        """
+        Args:
+            ecg_features: (B, D) 投影后的ECG特征（已L2归一化）
+            text_features: (B, D) 投影后的文本特征（已L2归一化）
+            text_emb: (B, D') 文本编码器原始输出（用于计算语义相似度）
+            logit_scale: 可选，外部传入的temperature，默认使用内部参数
+            output_dict: 是否返回字典
+
+        Returns:
+            loss or dict
+        """
+        if logit_scale is None:
+            logit_scale = self.logit_scale.exp()
+
+        # 1. 计算语义相似度矩阵（detach）
+        local_sim_matrix = self.compute_semantic_similarity(text_emb)
+
+        # 2. Gather相似度矩阵
+        gathered_sim = self.gather_sim_matrix(local_sim_matrix)
+
+        # 3. 计算logits
+        logits_per_ecg, logits_per_text = self.get_logits(ecg_features, text_features, logit_scale)
+
+        num_logits = logits_per_ecg.shape[0]
+
+        # 4. 应用sigmoid到可学习参数
+        threshold = torch.sigmoid(self.learnable_threshold)
+        soft_weight = torch.sigmoid(self.learnable_soft_weight)
+
+        # 5. 构建软标签
+        soft_labels = self.build_soft_labels(gathered_sim, num_logits, threshold, soft_weight)
+
+        # 6. 计算双向loss
+        loss_ecg = self.soft_cross_entropy(logits_per_ecg, soft_labels)
+        loss_text = self.soft_cross_entropy(logits_per_text, soft_labels)
+
+        total_loss = (loss_ecg + loss_text) / 2
+
+        if output_dict:
+            return {
+                "contrastive_loss": total_loss,
+                "loss_ecg2text": loss_ecg,
+                "loss_text2ecg": loss_text,
+                "threshold": threshold.detach(),
+                "soft_weight": soft_weight.detach(),
+            }
+        return total_loss
+
+
+class MultiScaleSemanticEnhancedClipLoss(nn.Module):
+    """
+    多尺度语义增强对比损失
+
+    特点：
+    1. 三个尺度(wave/beat/rhythm)各自有独立的投影头和可学习参数
+    2. 共享语义相似度矩阵（基于detach后的文本原始嵌入）
+    3. 使用可微分的软标签构建
+
+    Args:
+        embed_dim: ECG/Text encoder输出维度
+        proj_dim: 投影后的对齐空间维度
+        init_threshold_*: 各尺度的阈值初始值
+        init_soft_weight_*: 各尺度的软权重初始值
+    """
+
+    def __init__(
+        self,
+        embed_dim: int = 256,
+        proj_dim: int = 256,
+        # 各尺度参数初始值
+        init_threshold_wave: float = 3.0,
+        init_threshold_beat: float = 3.0,
+        init_threshold_rhythm: float = 3.0,
+        init_soft_weight_wave: float = -3.0,
+        init_soft_weight_beat: float = -3.0,
+        init_soft_weight_rhythm: float = -3.0,
+        # 分布式参数
+        local_loss: bool = True,
+        gather_with_grad: bool = True,
+        cache_labels: bool = True,
+        rank: int = 0,
+        world_size: int = 1,
+        use_horovod: bool = False,
+    ):
+        super().__init__()
+        self.embed_dim = embed_dim
+        self.proj_dim = proj_dim
+        self.local_loss = local_loss
+        self.gather_with_grad = gather_with_grad
+        self.rank = rank
+        self.world_size = world_size
+        self.use_horovod = use_horovod
+
+        # ========== ECG投影头（各尺度独立）==========
+        self.wave_proj = nn.Sequential(
+            nn.Linear(embed_dim, proj_dim),
+            nn.LayerNorm(proj_dim)
+        )
+        self.beat_proj = nn.Sequential(
+            nn.Linear(embed_dim, proj_dim),
+            nn.LayerNorm(proj_dim)
+        )
+        self.rhythm_proj = nn.Sequential(
+            nn.Linear(embed_dim, proj_dim),
+            nn.LayerNorm(proj_dim)
+        )
+
+        # ========== Text投影头（各尺度独立）==========
+        self.text_wave_proj = nn.Sequential(
+            nn.Linear(embed_dim, proj_dim),
+            nn.LayerNorm(proj_dim)
+        )
+        self.text_beat_proj = nn.Sequential(
+            nn.Linear(embed_dim, proj_dim),
+            nn.LayerNorm(proj_dim)
+        )
+        self.text_rhythm_proj = nn.Sequential(
+            nn.Linear(embed_dim, proj_dim),
+            nn.LayerNorm(proj_dim)
+        )
+
+        # ========== 各尺度的可学习参数（独立）==========
+        self.threshold_wave = nn.Parameter(torch.tensor(init_threshold_wave))
+        self.soft_weight_wave = nn.Parameter(torch.tensor(init_soft_weight_wave))
+
+        self.threshold_beat = nn.Parameter(torch.tensor(init_threshold_beat))
+        self.soft_weight_beat = nn.Parameter(torch.tensor(init_soft_weight_beat))
+
+        self.threshold_rhythm = nn.Parameter(torch.tensor(init_threshold_rhythm))
+        self.soft_weight_rhythm = nn.Parameter(torch.tensor(init_soft_weight_rhythm))
+
+        # ========== 共享的temperature ==========
+        self.logit_scale = nn.Parameter(torch.ones([]) * np.log(1 / 0.07))
+
+        # ========== 底层ClipLoss用于计算logits ==========
+        self.clip_loss = ClipLoss(
+            local_loss=local_loss,
+            gather_with_grad=gather_with_grad,
+            cache_labels=cache_labels,
+            rank=rank,
+            world_size=world_size,
+            use_horovod=use_horovod,
+        )
+
+    def compute_semantic_similarity(self, text_emb: torch.Tensor) -> torch.Tensor:
+        """计算batch内语义相似度矩阵（detach）"""
+        with torch.no_grad():
+            text_emb_detached = text_emb.detach()
+            text_emb_norm = F.normalize(text_emb_detached, dim=-1)
+            sim_matrix = text_emb_norm @ text_emb_norm.T
+        return sim_matrix
+
+    def gather_sim_matrix(self, sim_matrix: torch.Tensor) -> torch.Tensor:
+        """Gather语义相似度矩阵"""
+        if self.world_size == 1:
+            return sim_matrix
+
+        assert has_distributed, 'torch.distributed did not import correctly'
+
+        gathered_sim = [torch.zeros_like(sim_matrix) for _ in range(self.world_size)]
+        dist.all_gather(gathered_sim, sim_matrix)
+        all_sim = torch.cat(gathered_sim, dim=1)
+
+        if not self.local_loss:
+            gathered_rows = [torch.zeros_like(all_sim) for _ in range(self.world_size)]
+            dist.all_gather(gathered_rows, all_sim)
+            all_sim = torch.cat(gathered_rows, dim=0)
+
+        return all_sim
+
+    def build_soft_labels(
+        self,
+        sim_matrix: torch.Tensor,
+        num_logits: int,
+        threshold: torch.Tensor,
+        soft_weight: torch.Tensor
+    ) -> torch.Tensor:
+        """基于语义相似度构建软标签"""
+        device = sim_matrix.device
+        num_queries, num_classes = sim_matrix.shape
+
+        # 硬正样本位置
+        row_indices = torch.arange(num_queries, device=device)
+        if self.world_size > 1 and self.local_loss:
+            col_indices = row_indices + num_logits * self.rank
+        else:
+            col_indices = row_indices
+        col_indices = torch.clamp(col_indices, 0, num_classes - 1)
+
+        # 硬正样本掩码
+        hard_positive_mask = torch.zeros(num_queries, num_classes, device=device)
+        hard_positive_mask[row_indices, col_indices] = 1.0
+
+        # 软正样本
+        temperature = 10.0
+        soft_gate = torch.sigmoid(temperature * (sim_matrix - threshold))
+        soft_positive_weights = soft_gate * soft_weight * sim_matrix * (1 - hard_positive_mask)
+
+        soft_labels = hard_positive_mask + soft_positive_weights
+        return soft_labels
+
+    def soft_cross_entropy(self, logits: torch.Tensor, soft_labels: torch.Tensor) -> torch.Tensor:
+        """计算软交叉熵损失"""
+        log_probs = F.log_softmax(logits, dim=1)
+        soft_targets = soft_labels / (soft_labels.sum(dim=1, keepdim=True) + 1e-8)
+        loss = -(soft_targets * log_probs).sum(dim=1).mean()
+        return loss
+
+    def compute_scale_loss(
+        self,
+        ecg_z: torch.Tensor,
+        text_z: torch.Tensor,
+        gathered_sim: torch.Tensor,
+        threshold: torch.Tensor,
+        soft_weight: torch.Tensor,
+        logit_scale: torch.Tensor
+    ) -> torch.Tensor:
+        """计算单个尺度的loss"""
+        # 获取logits
+        logits_per_ecg, logits_per_text = self.clip_loss.get_logits(
+            ecg_z, text_z, logit_scale
+        )
+
+        num_logits = logits_per_ecg.shape[0]
+
+        # 应用sigmoid
+        threshold_val = torch.sigmoid(threshold)
+        soft_weight_val = torch.sigmoid(soft_weight)
+
+        # 构建软标签
+        soft_labels = self.build_soft_labels(
+            gathered_sim, num_logits, threshold_val, soft_weight_val
+        )
+
+        # 计算双向loss
+        loss_ecg = self.soft_cross_entropy(logits_per_ecg, soft_labels)
+        loss_text = self.soft_cross_entropy(logits_per_text, soft_labels)
+
+        return (loss_ecg + loss_text) / 2
+
+    def forward(
+        self,
+        wave_feat: torch.Tensor,
+        beat_feat: torch.Tensor,
+        rhythm_feat: torch.Tensor,
+        text_feat: torch.Tensor,
+        text_emb: torch.Tensor,
+        output_dict: bool = False
+    ):
+        """
+        Args:
+            wave_feat: (B, D) 波段级ECG特征
+            beat_feat: (B, D) 心拍级ECG特征
+            rhythm_feat: (B, D) 节律级ECG特征
+            text_feat: (B, D) 投影后的文本特征
+            text_emb: (B, D') 文本编码器原始输出（用于计算语义相似度）
+            output_dict: 是否返回字典
+
+        Returns:
+            loss or dict
+        """
+        logit_scale = self.logit_scale.exp()
+
+        # 1. 计算共享的语义相似度矩阵
+        local_sim_matrix = self.compute_semantic_similarity(text_emb)
+        gathered_sim = self.gather_sim_matrix(local_sim_matrix)
+
+        # 2. ECG投影 + L2归一化
+        wave_z = F.normalize(self.wave_proj(wave_feat), dim=-1)
+        beat_z = F.normalize(self.beat_proj(beat_feat), dim=-1)
+        rhythm_z = F.normalize(self.rhythm_proj(rhythm_feat), dim=-1)
+
+        # 3. Text投影 + L2归一化
+        text_wave_z = F.normalize(self.text_wave_proj(text_feat), dim=-1)
+        text_beat_z = F.normalize(self.text_beat_proj(text_feat), dim=-1)
+        text_rhythm_z = F.normalize(self.text_rhythm_proj(text_feat), dim=-1)
+
+        # 4. 更新ClipLoss的分布式参数
+        self.clip_loss.rank = self.rank
+        self.clip_loss.world_size = self.world_size
+
+        # 5. 计算各尺度loss（使用各自的可学习参数）
+        loss_wave = self.compute_scale_loss(
+            wave_z, text_wave_z, gathered_sim,
+            self.threshold_wave, self.soft_weight_wave, logit_scale
+        )
+        loss_beat = self.compute_scale_loss(
+            beat_z, text_beat_z, gathered_sim,
+            self.threshold_beat, self.soft_weight_beat, logit_scale
+        )
+        loss_rhythm = self.compute_scale_loss(
+            rhythm_z, text_rhythm_z, gathered_sim,
+            self.threshold_rhythm, self.soft_weight_rhythm, logit_scale
+        )
+
+        total_loss = loss_wave + loss_beat + loss_rhythm
+
+        if output_dict:
+            return {
+                "contrastive_loss": total_loss,
+                "loss_wave": loss_wave,
+                "loss_beat": loss_beat,
+                "loss_rhythm": loss_rhythm,
+                # 监控可学习参数
+                "threshold_wave": torch.sigmoid(self.threshold_wave).detach(),
+                "threshold_beat": torch.sigmoid(self.threshold_beat).detach(),
+                "threshold_rhythm": torch.sigmoid(self.threshold_rhythm).detach(),
+                "soft_weight_wave": torch.sigmoid(self.soft_weight_wave).detach(),
+                "soft_weight_beat": torch.sigmoid(self.soft_weight_beat).detach(),
+                "soft_weight_rhythm": torch.sigmoid(self.soft_weight_rhythm).detach(),
+            }
+        return total_loss
+
+    def get_ecg_embedding(
+        self,
+        wave_feat: torch.Tensor,
+        beat_feat: torch.Tensor,
+        rhythm_feat: torch.Tensor,
+        mode: str = 'concat'
+    ) -> torch.Tensor:
+        """
+        推理时获取ECG的最终表示
+
+        Args:
+            wave_feat, beat_feat, rhythm_feat: (B, D) 各层级特征
+            mode: 'concat' 拼接, 'mean' 平均, 'rhythm' 只用rhythm
+
+        Returns:
+            (B, proj_dim) 或 (B, 3*proj_dim) 取决于mode
+        """
+        wave_z = F.normalize(self.wave_proj(wave_feat), dim=-1)
+        beat_z = F.normalize(self.beat_proj(beat_feat), dim=-1)
+        rhythm_z = F.normalize(self.rhythm_proj(rhythm_feat), dim=-1)
+
+        if mode == 'concat':
+            return torch.cat([wave_z, beat_z, rhythm_z], dim=-1)
+        elif mode == 'mean':
+            return (wave_z + beat_z + rhythm_z) / 3
+        elif mode == 'rhythm':
+            return rhythm_z
+        else:
+            raise ValueError(f"Unknown mode: {mode}")
+
+    def get_text_embedding(
+        self,
+        text_feat: torch.Tensor,
+        mode: str = 'concat'
+    ) -> torch.Tensor:
+        """推理时获取Text的最终表示"""
+        text_wave_z = F.normalize(self.text_wave_proj(text_feat), dim=-1)
+        text_beat_z = F.normalize(self.text_beat_proj(text_feat), dim=-1)
+        text_rhythm_z = F.normalize(self.text_rhythm_proj(text_feat), dim=-1)
+
+        if mode == 'concat':
+            return torch.cat([text_wave_z, text_beat_z, text_rhythm_z], dim=-1)
+        elif mode == 'mean':
+            return (text_wave_z + text_beat_z + text_rhythm_z) / 3
+        elif mode == 'rhythm':
+            return text_rhythm_z
+        else:
+            raise ValueError(f"Unknown mode: {mode}")
+
+
 class SigLipLoss(nn.Module):
     """ Sigmoid Loss for Language Image Pre-Training (SigLIP) - https://arxiv.org/abs/2303.15343
 
