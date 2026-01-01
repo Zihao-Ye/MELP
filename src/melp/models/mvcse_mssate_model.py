@@ -37,7 +37,8 @@ from melp.backbone.mvcse_mssate import (
 from melp.models.base_pretrain_model import BasePretrainModel
 from melp.utils.openclip_loss import (
     ClipLoss, SoftClipLoss, LearnableSoftClipLoss,
-    MultiScaleClipLoss, MultiScaleSemanticEnhancedClipLoss
+    MultiScaleClipLoss, MultiScaleSemanticEnhancedClipLoss,
+    ComplementaryMultiScaleClipLoss
 )
 from melp.paths import PROMPT_PATH, DATASET_LABELS_PATH
 
@@ -269,17 +270,12 @@ class MVCSEMSSATEModel(BasePretrainModel):
                 nn.Linear(self.proj_hidden, self.ecg_out_dim),  # 投影到embed_dim
             )
 
-            # 初始化多尺度语义增强对比损失
-            self.multiscale_loss = MultiScaleSemanticEnhancedClipLoss(
+            # 初始化互补多尺度对比损失
+            self.multiscale_loss = ComplementaryMultiScaleClipLoss(
                 embed_dim=self.ecg_out_dim,
                 proj_dim=self.proj_out,
-                # 各尺度软标签参数初始值
-                init_threshold_wave=3.0,      # sigmoid后 ≈ 0.95
-                init_threshold_beat=3.0,
-                init_threshold_rhythm=3.0,
-                init_soft_weight_wave=-3.0,   # sigmoid后 ≈ 0.05
-                init_soft_weight_beat=-3.0,
-                init_soft_weight_rhythm=-3.0,
+                # 正交约束权重（需要足够大才能对抗对比loss）
+                ortho_weight=0.1,
                 # 分布式参数
                 local_loss=True,
                 gather_with_grad=True,
@@ -542,7 +538,7 @@ class MVCSEMSSATEModel(BasePretrainModel):
         text_output = self.encode_text(input_ids, attention_mask)
 
         if self.use_multiscale:
-            # ========== 多尺度语义增强对比学习 ==========
+            # ========== 互补多尺度对比学习 ==========
             # 更新分布式参数
             rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
             world_size = torch.distributed.get_world_size() if torch.distributed.is_initialized() else 1
@@ -551,29 +547,26 @@ class MVCSEMSSATEModel(BasePretrainModel):
             self.multiscale_loss.clip_loss.rank = rank
             self.multiscale_loss.clip_loss.world_size = world_size
 
-            # 计算多尺度语义增强loss
+            # 计算互补多尺度loss
             loss_output = self.multiscale_loss(
                 wave_feat=ecg_output['wave'],
                 beat_feat=ecg_output['beat'],
                 rhythm_feat=ecg_output['rhythm'],
                 text_feat=text_output['proj_text_emb'],  # 已投影的文本特征
-                text_emb=text_output['text_emb'],        # 原始文本嵌入（用于计算语义相似度）
                 output_dict=True
             )
 
             loss_dict = {
-                'loss': loss_output['contrastive_loss'],
-                'cma_loss': loss_output['contrastive_loss'],
+                'loss': loss_output['total_loss'],
+                'contrastive_loss': loss_output['contrastive_loss'],
+                'ortho_loss': loss_output['ortho_loss'],
                 'loss_wave': loss_output['loss_wave'],
                 'loss_beat': loss_output['loss_beat'],
                 'loss_rhythm': loss_output['loss_rhythm'],
-                # 可学习参数监控
-                'threshold_wave': loss_output['threshold_wave'],
-                'threshold_beat': loss_output['threshold_beat'],
-                'threshold_rhythm': loss_output['threshold_rhythm'],
-                'soft_weight_wave': loss_output['soft_weight_wave'],
-                'soft_weight_beat': loss_output['soft_weight_beat'],
-                'soft_weight_rhythm': loss_output['soft_weight_rhythm'],
+                # 正交程度监控（越小越好）
+                'cos_wave_beat': loss_output['cos_wave_beat'],
+                'cos_wave_rhythm': loss_output['cos_wave_rhythm'],
+                'cos_beat_rhythm': loss_output['cos_beat_rhythm'],
             }
         else:
             # ========== 单尺度对比学习（原有逻辑）==========

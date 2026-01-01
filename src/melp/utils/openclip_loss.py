@@ -1434,6 +1434,251 @@ class MultiScaleSemanticEnhancedClipLoss(nn.Module):
             raise ValueError(f"Unknown mode: {mode}")
 
 
+class ComplementaryMultiScaleClipLoss(nn.Module):
+    """
+    互补多尺度对比学习损失 (Complementary Multi-Scale Contrastive Loss)
+
+    理论基础：Minimum Redundancy Maximum Relevance (mRMR)
+    - Maximum Relevance: 每个尺度都与文本对齐（对比学习）
+    - Minimum Redundancy: 尺度之间信息正交（正交约束）
+
+    Loss = L_wave + L_beat + L_rhythm + λ × L_ortho
+
+    其中正交约束:
+    L_ortho = |cos(Z_w, Z_b)| + |cos(Z_w, Z_r)| + |cos(Z_b, Z_r)|
+
+    正交约束确保三个尺度学习互补的信息，而不是冗余的信息。
+    当特征服从高斯分布时，正交等价于独立，即最小化尺度间的互信息。
+
+    Args:
+        embed_dim: ECG/Text encoder输出维度
+        proj_dim: 投影后的对齐空间维度
+        ortho_weight: 正交约束权重 (默认0.1)
+        init_scale_*: 各尺度的temperature初始值
+    """
+
+    def __init__(
+        self,
+        embed_dim: int = 256,
+        proj_dim: int = 256,
+        # 正交约束权重
+        ortho_weight: float = 0.1,
+        # 独立temperature初始值
+        init_scale_wave: float = np.log(1 / 0.07),
+        init_scale_beat: float = np.log(1 / 0.07),
+        init_scale_rhythm: float = np.log(1 / 0.07),
+        # 分布式参数
+        local_loss: bool = True,
+        gather_with_grad: bool = True,
+        cache_labels: bool = True,
+        rank: int = 0,
+        world_size: int = 1,
+        use_horovod: bool = False,
+    ):
+        super().__init__()
+        self.embed_dim = embed_dim
+        self.proj_dim = proj_dim
+        self.ortho_weight = ortho_weight
+        self.local_loss = local_loss
+        self.gather_with_grad = gather_with_grad
+        self.rank = rank
+        self.world_size = world_size
+        self.use_horovod = use_horovod
+
+        # ========== ECG投影头（各尺度独立）==========
+        self.wave_proj = nn.Sequential(
+            nn.Linear(embed_dim, proj_dim),
+            nn.LayerNorm(proj_dim)
+        )
+        self.beat_proj = nn.Sequential(
+            nn.Linear(embed_dim, proj_dim),
+            nn.LayerNorm(proj_dim)
+        )
+        self.rhythm_proj = nn.Sequential(
+            nn.Linear(embed_dim, proj_dim),
+            nn.LayerNorm(proj_dim)
+        )
+
+        # ========== Text投影头（各尺度独立）==========
+        self.text_wave_proj = nn.Sequential(
+            nn.Linear(embed_dim, proj_dim),
+            nn.LayerNorm(proj_dim)
+        )
+        self.text_beat_proj = nn.Sequential(
+            nn.Linear(embed_dim, proj_dim),
+            nn.LayerNorm(proj_dim)
+        )
+        self.text_rhythm_proj = nn.Sequential(
+            nn.Linear(embed_dim, proj_dim),
+            nn.LayerNorm(proj_dim)
+        )
+
+        # ========== 独立Temperature ==========
+        self.logit_scale_wave = nn.Parameter(torch.tensor(init_scale_wave))
+        self.logit_scale_beat = nn.Parameter(torch.tensor(init_scale_beat))
+        self.logit_scale_rhythm = nn.Parameter(torch.tensor(init_scale_rhythm))
+
+        # ========== 底层ClipLoss ==========
+        self.clip_loss = ClipLoss(
+            local_loss=local_loss,
+            gather_with_grad=gather_with_grad,
+            cache_labels=cache_labels,
+            rank=rank,
+            world_size=world_size,
+            use_horovod=use_horovod,
+        )
+
+    def orthogonal_loss(
+        self,
+        wave_z: torch.Tensor,
+        beat_z: torch.Tensor,
+        rhythm_z: torch.Tensor
+    ) -> torch.Tensor:
+        """
+        计算正交约束损失
+
+        最小化尺度间的余弦相似度，强制学习互补信息。
+        当cos接近0时，表示两个尺度的特征正交（信息不重叠）。
+
+        Args:
+            wave_z, beat_z, rhythm_z: (B, D) 投影后的特征（已L2归一化）
+
+        Returns:
+            ortho_loss: scalar, 越小表示越正交
+        """
+        # 计算batch内每个样本的尺度间相似度的绝对值
+        cos_wb = F.cosine_similarity(wave_z, beat_z, dim=-1).abs()
+        cos_wr = F.cosine_similarity(wave_z, rhythm_z, dim=-1).abs()
+        cos_br = F.cosine_similarity(beat_z, rhythm_z, dim=-1).abs()
+
+        # 取均值
+        ortho_loss = (cos_wb.mean() + cos_wr.mean() + cos_br.mean()) / 3
+
+        return ortho_loss
+
+    def forward(
+        self,
+        wave_feat: torch.Tensor,
+        beat_feat: torch.Tensor,
+        rhythm_feat: torch.Tensor,
+        text_feat: torch.Tensor,
+        output_dict: bool = False
+    ):
+        """
+        Args:
+            wave_feat: (B, D) 波段级ECG特征
+            beat_feat: (B, D) 心拍级ECG特征
+            rhythm_feat: (B, D) 节律级ECG特征
+            text_feat: (B, D) 文本特征
+            output_dict: 是否返回详细字典
+
+        Returns:
+            total_loss or dict
+        """
+        # 1. 投影 + L2归一化
+        wave_z = F.normalize(self.wave_proj(wave_feat), dim=-1)
+        beat_z = F.normalize(self.beat_proj(beat_feat), dim=-1)
+        rhythm_z = F.normalize(self.rhythm_proj(rhythm_feat), dim=-1)
+
+        text_wave_z = F.normalize(self.text_wave_proj(text_feat), dim=-1)
+        text_beat_z = F.normalize(self.text_beat_proj(text_feat), dim=-1)
+        text_rhythm_z = F.normalize(self.text_rhythm_proj(text_feat), dim=-1)
+
+        # 2. 更新分布式参数
+        self.clip_loss.rank = self.rank
+        self.clip_loss.world_size = self.world_size
+
+        # 3. 计算对比损失（独立temperature）
+        loss_wave = self.clip_loss(
+            wave_z, text_wave_z, self.logit_scale_wave.exp()
+        )
+        loss_beat = self.clip_loss(
+            beat_z, text_beat_z, self.logit_scale_beat.exp()
+        )
+        loss_rhythm = self.clip_loss(
+            rhythm_z, text_rhythm_z, self.logit_scale_rhythm.exp()
+        )
+
+        contrastive_loss = loss_wave + loss_beat + loss_rhythm
+
+        # 4. 计算正交约束损失
+        ortho_loss = self.orthogonal_loss(wave_z, beat_z, rhythm_z)
+
+        # 5. 总损失
+        total_loss = contrastive_loss + self.ortho_weight * ortho_loss
+
+        if output_dict:
+            return {
+                # 主要损失
+                "total_loss": total_loss,
+                "contrastive_loss": contrastive_loss,
+                "ortho_loss": ortho_loss,
+                # 各尺度损失
+                "loss_wave": loss_wave,
+                "loss_beat": loss_beat,
+                "loss_rhythm": loss_rhythm,
+                # 监控指标：temperature
+                "scale_wave": self.logit_scale_wave.exp().detach(),
+                "scale_beat": self.logit_scale_beat.exp().detach(),
+                "scale_rhythm": self.logit_scale_rhythm.exp().detach(),
+                # 监控指标：正交程度（越小越好）
+                "cos_wave_beat": F.cosine_similarity(wave_z, beat_z, dim=-1).abs().mean().detach(),
+                "cos_wave_rhythm": F.cosine_similarity(wave_z, rhythm_z, dim=-1).abs().mean().detach(),
+                "cos_beat_rhythm": F.cosine_similarity(beat_z, rhythm_z, dim=-1).abs().mean().detach(),
+            }
+
+        return total_loss
+
+    def get_ecg_embedding(
+        self,
+        wave_feat: torch.Tensor,
+        beat_feat: torch.Tensor,
+        rhythm_feat: torch.Tensor,
+        mode: str = 'concat'
+    ) -> torch.Tensor:
+        """
+        推理时获取ECG的最终表示
+
+        Args:
+            wave_feat, beat_feat, rhythm_feat: (B, D) 各层级特征
+            mode: 'concat' 拼接, 'mean' 平均, 'rhythm' 只用rhythm
+
+        Returns:
+            (B, proj_dim) 或 (B, 3*proj_dim) 取决于mode
+        """
+        wave_z = F.normalize(self.wave_proj(wave_feat), dim=-1)
+        beat_z = F.normalize(self.beat_proj(beat_feat), dim=-1)
+        rhythm_z = F.normalize(self.rhythm_proj(rhythm_feat), dim=-1)
+
+        if mode == 'concat':
+            return torch.cat([wave_z, beat_z, rhythm_z], dim=-1)
+        elif mode == 'mean':
+            return (wave_z + beat_z + rhythm_z) / 3
+        elif mode == 'rhythm':
+            return rhythm_z
+        else:
+            raise ValueError(f"Unknown mode: {mode}")
+
+    def get_text_embedding(
+        self,
+        text_feat: torch.Tensor,
+        mode: str = 'concat'
+    ) -> torch.Tensor:
+        """推理时获取Text的最终表示"""
+        text_wave_z = F.normalize(self.text_wave_proj(text_feat), dim=-1)
+        text_beat_z = F.normalize(self.text_beat_proj(text_feat), dim=-1)
+        text_rhythm_z = F.normalize(self.text_rhythm_proj(text_feat), dim=-1)
+
+        if mode == 'concat':
+            return torch.cat([text_wave_z, text_beat_z, text_rhythm_z], dim=-1)
+        elif mode == 'mean':
+            return (text_wave_z + text_beat_z + text_rhythm_z) / 3
+        elif mode == 'rhythm':
+            return text_rhythm_z
+        else:
+            raise ValueError(f"Unknown mode: {mode}")
+
+
 class SigLipLoss(nn.Module):
     """ Sigmoid Loss for Language Image Pre-Training (SigLIP) - https://arxiv.org/abs/2303.15343
 
