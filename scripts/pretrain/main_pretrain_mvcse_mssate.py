@@ -136,6 +136,9 @@ def main(hparams: Namespace):
         shared_emb_dim=hparams.shared_emb_dim,
         # 对比学习参数
         use_learnable_sim=hparams.use_learnable_sim,
+        # 跨尺度对比参数
+        cross_scale_weight=hparams.cross_scale_weight,
+        cross_scale_temperature=hparams.cross_scale_temperature,
         # 优化器参数
         lr=hparams.lr,
         weight_decay=hparams.weight_decay,
@@ -210,6 +213,12 @@ if __name__ == '__main__':
                         help="Use learnable similarity for soft labels")
     parser.add_argument("--no_learnable_sim", action="store_false", dest="use_learnable_sim",
                         help="Disable learnable similarity")
+
+    # 跨尺度对比参数
+    parser.add_argument("--cross_scale_weight", type=float, default=1.0,
+                        help="Weight for cross-scale contrastive loss")
+    parser.add_argument("--cross_scale_temperature", type=float, default=0.1,
+                        help="Temperature for cross-scale contrastive loss")
 
     # 训练参数
     parser.add_argument("--seed", type=int, default=42)
