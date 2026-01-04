@@ -68,6 +68,7 @@ class MVCSEMSSATEModel(BasePretrainModel):
         mssate_num_heads: int = 8,
         channel_attention: str = 'se',
         use_relative_pos: bool = True,
+        use_lead_groups: bool = False,    # 是否启用肢体/胸导联分组
         # 文本编码器参数
         text_encoder_name: str = "ncbi/MedCPT-Query-Encoder",
         num_freeze_layers: int = 6,
@@ -112,6 +113,7 @@ class MVCSEMSSATEModel(BasePretrainModel):
         self.mssate_num_heads = mssate_num_heads
         self.channel_attention = channel_attention
         self.use_relative_pos = use_relative_pos
+        self.use_lead_groups = use_lead_groups
         # 跨尺度对比参数
         self.cross_scale_weight = cross_scale_weight
         self.cross_scale_temperature = cross_scale_temperature
@@ -164,17 +166,20 @@ class MVCSEMSSATEModel(BasePretrainModel):
             if self.ecg_encoder_name == 'hierarchical_mvcse_mssate_small':
                 self.ecg_encoder = hierarchical_mvcse_mssate_small(
                     seq_len=self.seq_len,
-                    output_dim=self.embed_dim
+                    output_dim=self.embed_dim,
+                    use_lead_groups=self.use_lead_groups
                 )
             elif self.ecg_encoder_name == 'hierarchical_mvcse_mssate_base':
                 self.ecg_encoder = hierarchical_mvcse_mssate_base(
                     seq_len=self.seq_len,
-                    output_dim=self.embed_dim
+                    output_dim=self.embed_dim,
+                    use_lead_groups=self.use_lead_groups
                 )
             elif self.ecg_encoder_name == 'hierarchical_mvcse_mssate_large':
                 self.ecg_encoder = hierarchical_mvcse_mssate_large(
                     seq_len=self.seq_len,
-                    output_dim=self.embed_dim
+                    output_dim=self.embed_dim,
+                    use_lead_groups=self.use_lead_groups
                 )
             else:
                 raise ValueError(f"Unknown hierarchical encoder: {self.ecg_encoder_name}")
@@ -191,28 +196,32 @@ class MVCSEMSSATEModel(BasePretrainModel):
                     seq_len=self.seq_len,
                     output_dim=self.proj_out,
                     channel_attention=self.channel_attention,
-                    use_relative_pos=self.use_relative_pos
+                    use_relative_pos=self.use_relative_pos,
+                    use_lead_groups=self.use_lead_groups
                 )
             elif self.ecg_encoder_name == 'mvcse_mssate_small':
                 self.ecg_encoder = mvcse_mssate_small(
                     seq_len=self.seq_len,
                     output_dim=self.proj_out,
                     channel_attention=self.channel_attention,
-                    use_relative_pos=self.use_relative_pos
+                    use_relative_pos=self.use_relative_pos,
+                    use_lead_groups=self.use_lead_groups
                 )
             elif self.ecg_encoder_name == 'mvcse_mssate_base':
                 self.ecg_encoder = mvcse_mssate_base(
                     seq_len=self.seq_len,
                     output_dim=self.proj_out,
                     channel_attention=self.channel_attention,
-                    use_relative_pos=self.use_relative_pos
+                    use_relative_pos=self.use_relative_pos,
+                    use_lead_groups=self.use_lead_groups
                 )
             elif self.ecg_encoder_name == 'mvcse_mssate_large':
                 self.ecg_encoder = mvcse_mssate_large(
                     seq_len=self.seq_len,
                     output_dim=self.proj_out,
                     channel_attention=self.channel_attention,
-                    use_relative_pos=self.use_relative_pos
+                    use_relative_pos=self.use_relative_pos,
+                    use_lead_groups=self.use_lead_groups
                 )
             else:
                 # 自定义配置
@@ -226,6 +235,7 @@ class MVCSEMSSATEModel(BasePretrainModel):
                     mssate_num_heads=self.mssate_num_heads,
                     channel_attention=self.channel_attention,
                     use_relative_pos=self.use_relative_pos,
+                    use_lead_groups=self.use_lead_groups,
                     output_dim=self.proj_out
                 )
 
@@ -663,21 +673,14 @@ class MVCSEMSSATEModel(BasePretrainModel):
             loss_beat = self.clip_loss(beat_z, text_beat_z, logit_scale)
             loss_rhythm = self.clip_loss(rhythm_z, text_rhythm_z, logit_scale)
 
-            loss_ecg_text = loss_wave + loss_beat + loss_rhythm
-
-            # 跨尺度对比损失
-            loss_cross_scale = self.cross_scale_contrastive_loss(wave_z, beat_z, rhythm_z)
-
-            # 总损失
-            total_loss = loss_ecg_text + self.cross_scale_weight * loss_cross_scale
+            # 总损失 = 三个尺度loss相加
+            total_loss = loss_wave + loss_beat + loss_rhythm
 
             loss_dict = {
                 'loss': total_loss,
-                'loss_ecg_text': loss_ecg_text,
                 'loss_wave': loss_wave,
                 'loss_beat': loss_beat,
                 'loss_rhythm': loss_rhythm,
-                'loss_cross_scale': loss_cross_scale,
                 'logit_scale': logit_scale,
             }
         else:

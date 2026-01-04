@@ -129,6 +129,7 @@ def main(hparams: Namespace):
         mssate_num_heads=hparams.mssate_num_heads,
         channel_attention=hparams.channel_attention,
         use_relative_pos=hparams.use_relative_pos,
+        use_lead_groups=hparams.use_lead_groups,
         # 文本编码器参数
         text_encoder_name=hparams.text_encoder_name,
         num_freeze_layers=hparams.num_freeze_layers,
@@ -202,6 +203,12 @@ if __name__ == '__main__':
     parser.add_argument("--no_relative_pos", action="store_false", dest="use_relative_pos",
                         help="Disable relative positional encoding")
 
+    # 导联分组参数
+    parser.add_argument("--use_lead_groups", action="store_true", default=False,
+                        help="Enable limb/chest lead grouping (肢体导联+胸导联分组)")
+    parser.add_argument("--no_lead_groups", action="store_false", dest="use_lead_groups",
+                        help="Disable lead grouping (default)")
+
     # 文本编码器参数
     parser.add_argument("--num_freeze_layers", type=int, default=6,
                         help="Number of frozen layers in text encoder")
@@ -215,8 +222,8 @@ if __name__ == '__main__':
                         help="Disable learnable similarity")
 
     # 跨尺度对比参数
-    parser.add_argument("--cross_scale_weight", type=float, default=1.0,
-                        help="Weight for cross-scale contrastive loss")
+    parser.add_argument("--cross_scale_weight", type=float, default=0.0,
+                        help="Weight for cross-scale contrastive loss (0 to disable)")
     parser.add_argument("--cross_scale_temperature", type=float, default=0.1,
                         help="Temperature for cross-scale contrastive loss")
 

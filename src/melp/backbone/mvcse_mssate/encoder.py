@@ -93,14 +93,14 @@ class AttentionPool1d(nn.Module):
 
 class MVCSEMSSATEEncoder(nn.Module):
     """
-    简化版 ECG 编码器 (无分组)。
+    ECG 编码器，支持导联分组。
 
     架构概述:
-    1. MVCSE: 空间编码 (无分组)
+    1. MVCSE: 空间编码
        - ResNet18前端特征提取
        - 多尺度Patch Embedding
-       - LeadTransformer (全局共享)
-       - CrossLeadAggregation (12导联→1)
+       - LeadTransformer (无分组时全局共享，分组时各组独立)
+       - CrossLeadAggregation (无分组: 12→1，分组: 6→1后拼接融合)
        - 可选SE/ECA通道注意力
 
     2. MS-SATE: 时序编码
@@ -118,7 +118,7 @@ class MVCSEMSSATEEncoder(nn.Module):
         seq_len: int = 5000,
         num_leads: int = 12,
         patch_configs: Optional[List[Dict]] = None,
-        lead_transformer_depth: int = 2,  # 简化: 从6层减到2层
+        lead_transformer_depth: int = 2,
         lead_transformer_heads: int = 4,
         lead_transformer_dim_head: int = 64,
         lead_transformer_mlp_ratio: float = 4.,
@@ -128,6 +128,8 @@ class MVCSEMSSATEEncoder(nn.Module):
         cross_lead_heads: int = 4,
         channel_attention: str = 'se',
         reduction: int = 4,
+        # 导联分组参数
+        use_lead_groups: bool = False,  # 是否启用肢体/胸导联分组
         # MS-SATE参数
         mssate_depth: int = 2,
         mssate_num_heads: int = 8,
@@ -149,6 +151,7 @@ class MVCSEMSSATEEncoder(nn.Module):
         self.embed_dim = embed_dim
         self.pool_type = pool_type
         self.pool_heads = pool_heads
+        self.use_lead_groups = use_lead_groups
 
         # 默认patch配置（适配ResNet输出）
         if patch_configs is None:
@@ -160,7 +163,7 @@ class MVCSEMSSATEEncoder(nn.Module):
 
         self.num_scales = len(patch_configs)
 
-        # MVCSE模块（简化版，无分组）
+        # MVCSE模块
         self.mvcse = MVCSEEncoder(
             embed_dim=embed_dim,
             seq_len=seq_len,
@@ -176,6 +179,7 @@ class MVCSEMSSATEEncoder(nn.Module):
             cross_lead_heads=cross_lead_heads,
             channel_attention=channel_attention,
             reduction=reduction,
+            use_lead_groups=use_lead_groups,  # 传递分组参数
             max_len=max_len
         )
 
@@ -323,14 +327,14 @@ class MVCSEMSSATEEncoder(nn.Module):
 
     def extra_repr(self) -> str:
         return (
-            f'embed_dim={self.embed_dim}, '
-            f'output_dim={self.output_dim}, pool_type={self.pool_type}'
+            f'embed_dim={self.embed_dim}, output_dim={self.output_dim}, '
+            f'pool_type={self.pool_type}, use_lead_groups={self.use_lead_groups}'
         )
 
 
 class HierarchicalMVCSEMSSATEEncoder(nn.Module):
     """
-    层级式ECG编码器 (使用可学习Query)。
+    层级式ECG编码器 (使用可学习Query)，支持导联分组。
 
     与原版MVCSEMSSATEEncoder的区别:
     1. 使用HierarchicalECGPooler替代Conv1d硬切分
@@ -344,14 +348,22 @@ class HierarchicalMVCSEMSSATEEncoder(nn.Module):
        - beat: (B, n_beat, D) 心拍级
        - rhythm: (B, n_rhythm, D) 节律级
     3. LeadTransformer: 单导联内时序建模
-    4. CrossLeadAggregation: 12导联聚合
-    5. 可选: MS-SATE进一步时序编码
+       - 无分组: 每层级1个共享Transformer
+       - 分组: 每层级2个独立Transformer (肢体/胸导联)
+    4. CrossLeadAggregation: 导联聚合
+       - 无分组: 12→1
+       - 分组: 每组6→1，然后拼接融合
 
     优势:
     - 无需手工设计patch大小，query自动学习关注位置
     - 三个层级分别对应不同粒度的ECG特征
     - 通过attention权重可视化模型学到的"切分"
     """
+
+    # 导联分组定义 (假设顺序: I, II, III, aVR, aVL, aVF, V1-V6)
+    LIMB_LEADS = [0, 1, 2, 3, 4, 5]      # I, II, III, aVR, aVL, aVF
+    CHEST_LEADS = [6, 7, 8, 9, 10, 11]   # V1-V6
+
     def __init__(
         self,
         embed_dim: int = 256,
@@ -371,6 +383,8 @@ class HierarchicalMVCSEMSSATEEncoder(nn.Module):
         lead_transformer_mlp_ratio: float = 4.,
         lead_transformer_dropout: float = 0.1,
         lead_transformer_drop_path: float = 0.1,
+        # 导联分组参数
+        use_lead_groups: bool = False,  # 是否启用肢体/胸导联分组
         # 输出参数
         output_dim: Optional[int] = None,
         pool_type: str = 'mean',  # 'mean', 'attn'
@@ -381,6 +395,7 @@ class HierarchicalMVCSEMSSATEEncoder(nn.Module):
         self.embed_dim = embed_dim
         self.num_leads = num_leads
         self.pooler_fusion = pooler_fusion
+        self.use_lead_groups = use_lead_groups
 
         # ResNet18前端 (全局共享)
         self.resnet = resnet18_frontend(in_channels=1)
@@ -403,69 +418,105 @@ class HierarchicalMVCSEMSSATEEncoder(nn.Module):
         self.n_beat_queries = n_beat_queries
         self.n_rhythm_queries = n_rhythm_queries
 
-        # LeadTransformer (每个层级独立，学习时序依赖)
-        if pooler_fusion == 'separate':
-            # 三个层级各自的Transformer
-            self.wave_transformer = LeadTransformer(
-                embed_dim=embed_dim,
-                depth=lead_transformer_depth,
-                num_heads=lead_transformer_heads,
-                dim_head=lead_transformer_dim_head,
-                mlp_ratio=lead_transformer_mlp_ratio,
-                dropout=lead_transformer_dropout,
-                drop_path=lead_transformer_drop_path,
-                max_len=max_len,
-                use_relative_pos=True
-            )
-            self.beat_transformer = LeadTransformer(
-                embed_dim=embed_dim,
-                depth=lead_transformer_depth,
-                num_heads=lead_transformer_heads,
-                dim_head=lead_transformer_dim_head,
-                mlp_ratio=lead_transformer_mlp_ratio,
-                dropout=lead_transformer_dropout,
-                drop_path=lead_transformer_drop_path,
-                max_len=max_len,
-                use_relative_pos=True
-            )
-            self.rhythm_transformer = LeadTransformer(
-                embed_dim=embed_dim,
-                depth=lead_transformer_depth,
-                num_heads=lead_transformer_heads,
-                dim_head=lead_transformer_dim_head,
-                mlp_ratio=lead_transformer_mlp_ratio,
-                dropout=lead_transformer_dropout,
-                drop_path=lead_transformer_drop_path,
-                max_len=max_len,
-                use_relative_pos=True
-            )
-        else:
-            # 统一的Transformer处理融合后的特征
-            self.unified_transformer = LeadTransformer(
-                embed_dim=embed_dim,
-                depth=lead_transformer_depth,
-                num_heads=lead_transformer_heads,
-                dim_head=lead_transformer_dim_head,
-                mlp_ratio=lead_transformer_mlp_ratio,
-                dropout=lead_transformer_dropout,
-                drop_path=lead_transformer_drop_path,
-                max_len=max_len,
-                use_relative_pos=True
-            )
-
-        # 跨导联聚合 (12导联 → 1)
+        # 跨导联聚合模块
         from .attention import CrossLeadAggregation
+
+        # LeadTransformer 和 CrossLeadAggregation
         if pooler_fusion == 'separate':
-            self.wave_cross_lead = CrossLeadAggregation(embed_dim=embed_dim, depth=1)
-            self.beat_cross_lead = CrossLeadAggregation(embed_dim=embed_dim, depth=1)
-            self.rhythm_cross_lead = CrossLeadAggregation(embed_dim=embed_dim, depth=1)
+            if use_lead_groups:
+                # ========== 分组模式: 每层级×每组 = 6个Transformer + 6个Aggregation ==========
+                # Wave层级
+                self.wave_limb_transformer = LeadTransformer(
+                    embed_dim=embed_dim, depth=lead_transformer_depth,
+                    num_heads=lead_transformer_heads, dim_head=lead_transformer_dim_head,
+                    mlp_ratio=lead_transformer_mlp_ratio, dropout=lead_transformer_dropout,
+                    drop_path=lead_transformer_drop_path, max_len=max_len, use_relative_pos=True
+                )
+                self.wave_chest_transformer = LeadTransformer(
+                    embed_dim=embed_dim, depth=lead_transformer_depth,
+                    num_heads=lead_transformer_heads, dim_head=lead_transformer_dim_head,
+                    mlp_ratio=lead_transformer_mlp_ratio, dropout=lead_transformer_dropout,
+                    drop_path=lead_transformer_drop_path, max_len=max_len, use_relative_pos=True
+                )
+                self.wave_limb_agg = CrossLeadAggregation(embed_dim=embed_dim, depth=1)
+                self.wave_chest_agg = CrossLeadAggregation(embed_dim=embed_dim, depth=1)
+                self.wave_group_fusion = nn.Sequential(
+                    nn.Linear(embed_dim * 2, embed_dim), nn.LayerNorm(embed_dim), nn.GELU()
+                )
+
+                # Beat层级
+                self.beat_limb_transformer = LeadTransformer(
+                    embed_dim=embed_dim, depth=lead_transformer_depth,
+                    num_heads=lead_transformer_heads, dim_head=lead_transformer_dim_head,
+                    mlp_ratio=lead_transformer_mlp_ratio, dropout=lead_transformer_dropout,
+                    drop_path=lead_transformer_drop_path, max_len=max_len, use_relative_pos=True
+                )
+                self.beat_chest_transformer = LeadTransformer(
+                    embed_dim=embed_dim, depth=lead_transformer_depth,
+                    num_heads=lead_transformer_heads, dim_head=lead_transformer_dim_head,
+                    mlp_ratio=lead_transformer_mlp_ratio, dropout=lead_transformer_dropout,
+                    drop_path=lead_transformer_drop_path, max_len=max_len, use_relative_pos=True
+                )
+                self.beat_limb_agg = CrossLeadAggregation(embed_dim=embed_dim, depth=1)
+                self.beat_chest_agg = CrossLeadAggregation(embed_dim=embed_dim, depth=1)
+                self.beat_group_fusion = nn.Sequential(
+                    nn.Linear(embed_dim * 2, embed_dim), nn.LayerNorm(embed_dim), nn.GELU()
+                )
+
+                # Rhythm层级
+                self.rhythm_limb_transformer = LeadTransformer(
+                    embed_dim=embed_dim, depth=lead_transformer_depth,
+                    num_heads=lead_transformer_heads, dim_head=lead_transformer_dim_head,
+                    mlp_ratio=lead_transformer_mlp_ratio, dropout=lead_transformer_dropout,
+                    drop_path=lead_transformer_drop_path, max_len=max_len, use_relative_pos=True
+                )
+                self.rhythm_chest_transformer = LeadTransformer(
+                    embed_dim=embed_dim, depth=lead_transformer_depth,
+                    num_heads=lead_transformer_heads, dim_head=lead_transformer_dim_head,
+                    mlp_ratio=lead_transformer_mlp_ratio, dropout=lead_transformer_dropout,
+                    drop_path=lead_transformer_drop_path, max_len=max_len, use_relative_pos=True
+                )
+                self.rhythm_limb_agg = CrossLeadAggregation(embed_dim=embed_dim, depth=1)
+                self.rhythm_chest_agg = CrossLeadAggregation(embed_dim=embed_dim, depth=1)
+                self.rhythm_group_fusion = nn.Sequential(
+                    nn.Linear(embed_dim * 2, embed_dim), nn.LayerNorm(embed_dim), nn.GELU()
+                )
+            else:
+                # ========== 无分组模式: 每层级1个Transformer + 1个Aggregation ==========
+                self.wave_transformer = LeadTransformer(
+                    embed_dim=embed_dim, depth=lead_transformer_depth,
+                    num_heads=lead_transformer_heads, dim_head=lead_transformer_dim_head,
+                    mlp_ratio=lead_transformer_mlp_ratio, dropout=lead_transformer_dropout,
+                    drop_path=lead_transformer_drop_path, max_len=max_len, use_relative_pos=True
+                )
+                self.beat_transformer = LeadTransformer(
+                    embed_dim=embed_dim, depth=lead_transformer_depth,
+                    num_heads=lead_transformer_heads, dim_head=lead_transformer_dim_head,
+                    mlp_ratio=lead_transformer_mlp_ratio, dropout=lead_transformer_dropout,
+                    drop_path=lead_transformer_drop_path, max_len=max_len, use_relative_pos=True
+                )
+                self.rhythm_transformer = LeadTransformer(
+                    embed_dim=embed_dim, depth=lead_transformer_depth,
+                    num_heads=lead_transformer_heads, dim_head=lead_transformer_dim_head,
+                    mlp_ratio=lead_transformer_mlp_ratio, dropout=lead_transformer_dropout,
+                    drop_path=lead_transformer_drop_path, max_len=max_len, use_relative_pos=True
+                )
+                self.wave_cross_lead = CrossLeadAggregation(embed_dim=embed_dim, depth=1)
+                self.beat_cross_lead = CrossLeadAggregation(embed_dim=embed_dim, depth=1)
+                self.rhythm_cross_lead = CrossLeadAggregation(embed_dim=embed_dim, depth=1)
         else:
+            # 统一的Transformer处理融合后的特征 (暂不支持分组)
+            self.unified_transformer = LeadTransformer(
+                embed_dim=embed_dim, depth=lead_transformer_depth,
+                num_heads=lead_transformer_heads, dim_head=lead_transformer_dim_head,
+                mlp_ratio=lead_transformer_mlp_ratio, dropout=lead_transformer_dropout,
+                drop_path=lead_transformer_drop_path, max_len=max_len, use_relative_pos=True
+            )
             self.unified_cross_lead = CrossLeadAggregation(embed_dim=embed_dim, depth=1)
 
         # 最终输出
         self.pool_type = pool_type
         if pooler_fusion == 'separate':
-            total_queries = n_wave_queries + n_beat_queries + n_rhythm_queries
             fusion_dim = embed_dim * 3 if pool_type == 'concat' else embed_dim
         else:
             fusion_dim = embed_dim
@@ -515,17 +566,48 @@ class HierarchicalMVCSEMSSATEEncoder(nn.Module):
         rhythm_stacked = torch.stack(all_rhythm_feats, dim=1) # (B, 12, n_rhythm, D)
 
         if self.pooler_fusion == 'separate':
-            # 分别处理三个层级
+            if self.use_lead_groups:
+                # ========== 分组模式 ==========
+                # 分离肢体导联和胸导联
+                wave_limb = wave_stacked[:, self.LIMB_LEADS, :, :]      # (B, 6, n_wave, D)
+                wave_chest = wave_stacked[:, self.CHEST_LEADS, :, :]    # (B, 6, n_wave, D)
+                beat_limb = beat_stacked[:, self.LIMB_LEADS, :, :]      # (B, 6, n_beat, D)
+                beat_chest = beat_stacked[:, self.CHEST_LEADS, :, :]    # (B, 6, n_beat, D)
+                rhythm_limb = rhythm_stacked[:, self.LIMB_LEADS, :, :]  # (B, 6, n_rhythm, D)
+                rhythm_chest = rhythm_stacked[:, self.CHEST_LEADS, :, :]# (B, 6, n_rhythm, D)
 
-            # LeadTransformer: 时序建模
-            wave_stacked = self.wave_transformer(wave_stacked)    # (B, 12, n_wave, D)
-            beat_stacked = self.beat_transformer(beat_stacked)    # (B, 12, n_beat, D)
-            rhythm_stacked = self.rhythm_transformer(rhythm_stacked)  # (B, 12, n_rhythm, D)
+                # Wave层级: 各组独立处理后融合
+                wave_limb = self.wave_limb_transformer(wave_limb)
+                wave_chest = self.wave_chest_transformer(wave_chest)
+                wave_limb_agg, _ = self.wave_limb_agg(wave_limb)        # (B, n_wave, D)
+                wave_chest_agg, _ = self.wave_chest_agg(wave_chest)     # (B, n_wave, D)
+                wave_agg = self.wave_group_fusion(torch.cat([wave_limb_agg, wave_chest_agg], dim=-1))
 
-            # CrossLeadAggregation: 12导联聚合
-            wave_agg, _ = self.wave_cross_lead(wave_stacked)    # (B, n_wave, D)
-            beat_agg, _ = self.beat_cross_lead(beat_stacked)    # (B, n_beat, D)
-            rhythm_agg, _ = self.rhythm_cross_lead(rhythm_stacked)  # (B, n_rhythm, D)
+                # Beat层级
+                beat_limb = self.beat_limb_transformer(beat_limb)
+                beat_chest = self.beat_chest_transformer(beat_chest)
+                beat_limb_agg, _ = self.beat_limb_agg(beat_limb)
+                beat_chest_agg, _ = self.beat_chest_agg(beat_chest)
+                beat_agg = self.beat_group_fusion(torch.cat([beat_limb_agg, beat_chest_agg], dim=-1))
+
+                # Rhythm层级
+                rhythm_limb = self.rhythm_limb_transformer(rhythm_limb)
+                rhythm_chest = self.rhythm_chest_transformer(rhythm_chest)
+                rhythm_limb_agg, _ = self.rhythm_limb_agg(rhythm_limb)
+                rhythm_chest_agg, _ = self.rhythm_chest_agg(rhythm_chest)
+                rhythm_agg = self.rhythm_group_fusion(torch.cat([rhythm_limb_agg, rhythm_chest_agg], dim=-1))
+
+            else:
+                # ========== 无分组模式 ==========
+                # LeadTransformer: 时序建模
+                wave_stacked = self.wave_transformer(wave_stacked)    # (B, 12, n_wave, D)
+                beat_stacked = self.beat_transformer(beat_stacked)    # (B, 12, n_beat, D)
+                rhythm_stacked = self.rhythm_transformer(rhythm_stacked)  # (B, 12, n_rhythm, D)
+
+                # CrossLeadAggregation: 12导联聚合
+                wave_agg, _ = self.wave_cross_lead(wave_stacked)    # (B, n_wave, D)
+                beat_agg, _ = self.beat_cross_lead(beat_stacked)    # (B, n_beat, D)
+                rhythm_agg, _ = self.rhythm_cross_lead(rhythm_stacked)  # (B, n_rhythm, D)
 
             # 特征池化
             if self.pool_type == 'mean':
@@ -540,12 +622,7 @@ class HierarchicalMVCSEMSSATEEncoder(nn.Module):
                 output = torch.cat([wave_pooled, beat_pooled, rhythm_pooled], dim=-1)
 
         else:
-            # concat或hierarchical模式
-            # 使用统一的Transformer处理
-            fused = self.hierarchical_pooler.forward(
-                rearrange(self.resnet(x[:, 0:1, :]), 'b c n -> b n c')
-            )['fused_features']
-            # TODO: 需要重新设计这部分逻辑
+            # concat或hierarchical模式 (暂不支持分组)
             fused_stacked = torch.cat([wave_stacked, beat_stacked, rhythm_stacked], dim=2)
             fused_stacked = self.unified_transformer(fused_stacked)
             fused_agg, _ = self.unified_cross_lead(fused_stacked)
@@ -671,13 +748,46 @@ class HierarchicalMVCSEMSSATEEncoder(nn.Module):
 
         # LeadTransformer + CrossLeadAggregation
         if self.pooler_fusion == 'separate':
-            wave_stacked = self.wave_transformer(wave_stacked)
-            beat_stacked = self.beat_transformer(beat_stacked)
-            rhythm_stacked = self.rhythm_transformer(rhythm_stacked)
+            if self.use_lead_groups:
+                # ========== 分组模式 ==========
+                # 分离肢体导联和胸导联
+                wave_limb = wave_stacked[:, self.LIMB_LEADS, :, :]
+                wave_chest = wave_stacked[:, self.CHEST_LEADS, :, :]
+                beat_limb = beat_stacked[:, self.LIMB_LEADS, :, :]
+                beat_chest = beat_stacked[:, self.CHEST_LEADS, :, :]
+                rhythm_limb = rhythm_stacked[:, self.LIMB_LEADS, :, :]
+                rhythm_chest = rhythm_stacked[:, self.CHEST_LEADS, :, :]
 
-            wave_agg, _ = self.wave_cross_lead(wave_stacked)
-            beat_agg, _ = self.beat_cross_lead(beat_stacked)
-            rhythm_agg, _ = self.rhythm_cross_lead(rhythm_stacked)
+                # Wave层级
+                wave_limb = self.wave_limb_transformer(wave_limb)
+                wave_chest = self.wave_chest_transformer(wave_chest)
+                wave_limb_agg, _ = self.wave_limb_agg(wave_limb)
+                wave_chest_agg, _ = self.wave_chest_agg(wave_chest)
+                wave_agg = self.wave_group_fusion(torch.cat([wave_limb_agg, wave_chest_agg], dim=-1))
+
+                # Beat层级
+                beat_limb = self.beat_limb_transformer(beat_limb)
+                beat_chest = self.beat_chest_transformer(beat_chest)
+                beat_limb_agg, _ = self.beat_limb_agg(beat_limb)
+                beat_chest_agg, _ = self.beat_chest_agg(beat_chest)
+                beat_agg = self.beat_group_fusion(torch.cat([beat_limb_agg, beat_chest_agg], dim=-1))
+
+                # Rhythm层级
+                rhythm_limb = self.rhythm_limb_transformer(rhythm_limb)
+                rhythm_chest = self.rhythm_chest_transformer(rhythm_chest)
+                rhythm_limb_agg, _ = self.rhythm_limb_agg(rhythm_limb)
+                rhythm_chest_agg, _ = self.rhythm_chest_agg(rhythm_chest)
+                rhythm_agg = self.rhythm_group_fusion(torch.cat([rhythm_limb_agg, rhythm_chest_agg], dim=-1))
+
+            else:
+                # ========== 无分组模式 ==========
+                wave_stacked = self.wave_transformer(wave_stacked)
+                beat_stacked = self.beat_transformer(beat_stacked)
+                rhythm_stacked = self.rhythm_transformer(rhythm_stacked)
+
+                wave_agg, _ = self.wave_cross_lead(wave_stacked)
+                beat_agg, _ = self.beat_cross_lead(beat_stacked)
+                rhythm_agg, _ = self.rhythm_cross_lead(rhythm_stacked)
 
             # 池化: (B, N, D) -> (B, D)
             wave_pooled = wave_agg.mean(dim=1)
@@ -697,7 +807,8 @@ class HierarchicalMVCSEMSSATEEncoder(nn.Module):
         return (
             f'embed_dim={self.embed_dim}, num_leads={self.num_leads}, '
             f'queries=(wave={self.n_wave_queries}, beat={self.n_beat_queries}, '
-            f'rhythm={self.n_rhythm_queries}), fusion={self.pooler_fusion}'
+            f'rhythm={self.n_rhythm_queries}), fusion={self.pooler_fusion}, '
+            f'use_lead_groups={self.use_lead_groups}'
         )
 
 
