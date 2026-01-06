@@ -55,8 +55,8 @@ def load_model(ckpt_path: str):
     # 打印模型信息
     print(f"  - ECG Encoder: {model.ecg_encoder_name}")
     print(f"  - Multi-scale: {model.use_multiscale}")
-    if hasattr(model, 'use_lead_groups'):
-        print(f"  - Lead Groups: {model.use_lead_groups}")
+    if hasattr(model, 'lead_group_strategy'):
+        print(f"  - Lead Group Strategy: {model.lead_group_strategy}")
 
     return model
 

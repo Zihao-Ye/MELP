@@ -68,7 +68,8 @@ class MVCSEMSSATEModel(BasePretrainModel):
         mssate_num_heads: int = 8,
         channel_attention: str = 'se',
         use_relative_pos: bool = True,
-        use_lead_groups: bool = False,    # 是否启用肢体/胸导联分组
+        lead_group_strategy: str = 'none',  # 'none', 'limb_chest', 'lisa'
+        use_lead_groups: bool = False,    # 兼容旧参数
         # 文本编码器参数
         text_encoder_name: str = "ncbi/MedCPT-Query-Encoder",
         num_freeze_layers: int = 6,
@@ -113,7 +114,10 @@ class MVCSEMSSATEModel(BasePretrainModel):
         self.mssate_num_heads = mssate_num_heads
         self.channel_attention = channel_attention
         self.use_relative_pos = use_relative_pos
-        self.use_lead_groups = use_lead_groups
+        # 处理分组策略（兼容旧参数）
+        if use_lead_groups and lead_group_strategy == 'none':
+            lead_group_strategy = 'limb_chest'
+        self.lead_group_strategy = lead_group_strategy
         # 跨尺度对比参数
         self.cross_scale_weight = cross_scale_weight
         self.cross_scale_temperature = cross_scale_temperature
@@ -167,19 +171,19 @@ class MVCSEMSSATEModel(BasePretrainModel):
                 self.ecg_encoder = hierarchical_mvcse_mssate_small(
                     seq_len=self.seq_len,
                     output_dim=self.embed_dim,
-                    use_lead_groups=self.use_lead_groups
+                    lead_group_strategy=self.lead_group_strategy
                 )
             elif self.ecg_encoder_name == 'hierarchical_mvcse_mssate_base':
                 self.ecg_encoder = hierarchical_mvcse_mssate_base(
                     seq_len=self.seq_len,
                     output_dim=self.embed_dim,
-                    use_lead_groups=self.use_lead_groups
+                    lead_group_strategy=self.lead_group_strategy
                 )
             elif self.ecg_encoder_name == 'hierarchical_mvcse_mssate_large':
                 self.ecg_encoder = hierarchical_mvcse_mssate_large(
                     seq_len=self.seq_len,
                     output_dim=self.embed_dim,
-                    use_lead_groups=self.use_lead_groups
+                    lead_group_strategy=self.lead_group_strategy
                 )
             else:
                 raise ValueError(f"Unknown hierarchical encoder: {self.ecg_encoder_name}")
@@ -197,7 +201,7 @@ class MVCSEMSSATEModel(BasePretrainModel):
                     output_dim=self.proj_out,
                     channel_attention=self.channel_attention,
                     use_relative_pos=self.use_relative_pos,
-                    use_lead_groups=self.use_lead_groups
+                    lead_group_strategy=self.lead_group_strategy
                 )
             elif self.ecg_encoder_name == 'mvcse_mssate_small':
                 self.ecg_encoder = mvcse_mssate_small(
@@ -205,7 +209,7 @@ class MVCSEMSSATEModel(BasePretrainModel):
                     output_dim=self.proj_out,
                     channel_attention=self.channel_attention,
                     use_relative_pos=self.use_relative_pos,
-                    use_lead_groups=self.use_lead_groups
+                    lead_group_strategy=self.lead_group_strategy
                 )
             elif self.ecg_encoder_name == 'mvcse_mssate_base':
                 self.ecg_encoder = mvcse_mssate_base(
@@ -213,7 +217,7 @@ class MVCSEMSSATEModel(BasePretrainModel):
                     output_dim=self.proj_out,
                     channel_attention=self.channel_attention,
                     use_relative_pos=self.use_relative_pos,
-                    use_lead_groups=self.use_lead_groups
+                    lead_group_strategy=self.lead_group_strategy
                 )
             elif self.ecg_encoder_name == 'mvcse_mssate_large':
                 self.ecg_encoder = mvcse_mssate_large(
@@ -221,7 +225,7 @@ class MVCSEMSSATEModel(BasePretrainModel):
                     output_dim=self.proj_out,
                     channel_attention=self.channel_attention,
                     use_relative_pos=self.use_relative_pos,
-                    use_lead_groups=self.use_lead_groups
+                    lead_group_strategy=self.lead_group_strategy
                 )
             else:
                 # 自定义配置
@@ -235,7 +239,7 @@ class MVCSEMSSATEModel(BasePretrainModel):
                     mssate_num_heads=self.mssate_num_heads,
                     channel_attention=self.channel_attention,
                     use_relative_pos=self.use_relative_pos,
-                    use_lead_groups=self.use_lead_groups,
+                    lead_group_strategy=self.lead_group_strategy,
                     output_dim=self.proj_out
                 )
 

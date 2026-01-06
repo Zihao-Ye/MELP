@@ -134,7 +134,7 @@ def main(hparams: Namespace):
             ecg_encoder_name=hparams.ecg_encoder_name,
             text_encoder_name=hparams.text_encoder_name,
             shared_emb_dim=hparams.shared_emb_dim,
-            use_lead_groups=hparams.use_lead_groups,
+            lead_group_strategy=hparams.lead_group_strategy,
         )
 
     # 获取特征维度（多尺度模型concat三个尺度，维度为3*proj_out）
@@ -306,10 +306,9 @@ if __name__ == '__main__':
                         help="Text encoder name (used when no ckpt_path provided)")
     parser.add_argument("--shared_emb_dim", type=int, default=256,
                         help="Shared embedding dimension")
-    parser.add_argument("--use_lead_groups", action="store_true", default=False,
-                        help="Enable limb/chest lead grouping (used when no ckpt_path provided)")
-    parser.add_argument("--no_lead_groups", action="store_false", dest="use_lead_groups",
-                        help="Disable lead grouping")
+    parser.add_argument("--lead_group_strategy", type=str, default="none",
+                        choices=["none", "limb_chest", "lisa"],
+                        help="Lead grouping strategy (used when no ckpt_path provided): none, limb_chest (2 groups), lisa (5 groups)")
 
     # 数据参数
     parser.add_argument("--dataset_name", type=str, default="ptbxl_super_class",

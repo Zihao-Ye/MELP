@@ -129,7 +129,7 @@ def main(hparams: Namespace):
         mssate_num_heads=hparams.mssate_num_heads,
         channel_attention=hparams.channel_attention,
         use_relative_pos=hparams.use_relative_pos,
-        use_lead_groups=hparams.use_lead_groups,
+        lead_group_strategy=hparams.lead_group_strategy,
         # 文本编码器参数
         text_encoder_name=hparams.text_encoder_name,
         num_freeze_layers=hparams.num_freeze_layers,
@@ -204,10 +204,9 @@ if __name__ == '__main__':
                         help="Disable relative positional encoding")
 
     # 导联分组参数
-    parser.add_argument("--use_lead_groups", action="store_true", default=False,
-                        help="Enable limb/chest lead grouping (肢体导联+胸导联分组)")
-    parser.add_argument("--no_lead_groups", action="store_false", dest="use_lead_groups",
-                        help="Disable lead grouping (default)")
+    parser.add_argument("--lead_group_strategy", type=str, default="none",
+                        choices=["none", "limb_chest", "lisa"],
+                        help="Lead grouping strategy: none (no grouping), limb_chest (2 groups), lisa (5 groups based on cardiac anatomy)")
 
     # 文本编码器参数
     parser.add_argument("--num_freeze_layers", type=int, default=6,

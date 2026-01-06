@@ -334,7 +334,7 @@ class MVCSEMSSATEEncoder(nn.Module):
 
 class HierarchicalMVCSEMSSATEEncoder(nn.Module):
     """
-    层级式ECG编码器 (使用可学习Query)，支持导联分组。
+    层级式ECG编码器 (使用可学习Query)，支持多种导联分组策略。
 
     与原版MVCSEMSSATEEncoder的区别:
     1. 使用HierarchicalECGPooler替代Conv1d硬切分
@@ -349,20 +349,37 @@ class HierarchicalMVCSEMSSATEEncoder(nn.Module):
        - rhythm: (B, n_rhythm, D) 节律级
     3. LeadTransformer: 单导联内时序建模
        - 无分组: 每层级1个共享Transformer
-       - 分组: 每层级2个独立Transformer (肢体/胸导联)
+       - LISA分组: 每层级5个独立Transformer
     4. CrossLeadAggregation: 导联聚合
        - 无分组: 12→1
-       - 分组: 每组6→1，然后拼接融合
+       - LISA分组: 每组独立聚合，然后融合
 
-    优势:
-    - 无需手工设计patch大小，query自动学习关注位置
-    - 三个层级分别对应不同粒度的ECG特征
-    - 通过attention权重可视化模型学到的"切分"
+    支持的分组策略 (lead_group_strategy):
+    - 'none': 不分组，12导联统一处理
+    - 'limb_chest': 肢体导联(6) + 胸导联(6)
+    - 'lisa': LISA解剖分组 - Lateral(4) + Inferior(3) + Septal(2) + Anterior(2) + aVR(1)
+
+    LISA分组基于心脏解剖位置:
+    - Lateral (侧壁): I, aVL, V5, V6 - 观察心脏侧壁
+    - Inferior (下壁): II, III, aVF - 观察心脏下壁
+    - Septal (间隔): V1, V2 - 观察室间隔
+    - Anterior (前壁): V3, V4 - 观察心脏前壁
+    - aVR: 心腔内视角，综合参考导联
     """
 
-    # 导联分组定义 (假设顺序: I, II, III, aVR, aVL, aVF, V1-V6)
+    # ==================== 导联分组定义 ====================
+    # 导联顺序: I(0), II(1), III(2), aVR(3), aVL(4), aVF(5), V1(6)-V6(11)
+
+    # 策略1: 肢体/胸导联分组 (2组)
     LIMB_LEADS = [0, 1, 2, 3, 4, 5]      # I, II, III, aVR, aVL, aVF
     CHEST_LEADS = [6, 7, 8, 9, 10, 11]   # V1-V6
+
+    # 策略2: LISA解剖分组 (5组)
+    LATERAL_LEADS = [0, 4, 10, 11]   # I, aVL, V5, V6 - 侧壁
+    INFERIOR_LEADS = [1, 2, 5]        # II, III, aVF - 下壁
+    SEPTAL_LEADS = [6, 7]             # V1, V2 - 间隔
+    ANTERIOR_LEADS = [8, 9]           # V3, V4 - 前壁
+    AVR_LEADS = [3]                   # aVR - 参考
 
     def __init__(
         self,
@@ -384,7 +401,8 @@ class HierarchicalMVCSEMSSATEEncoder(nn.Module):
         lead_transformer_dropout: float = 0.1,
         lead_transformer_drop_path: float = 0.1,
         # 导联分组参数
-        use_lead_groups: bool = False,  # 是否启用肢体/胸导联分组
+        lead_group_strategy: str = 'none',  # 'none', 'limb_chest', 'lisa'
+        use_lead_groups: bool = False,  # 兼容旧参数，如果为True则使用limb_chest
         # 输出参数
         output_dim: Optional[int] = None,
         pool_type: str = 'mean',  # 'mean', 'attn'
@@ -395,7 +413,11 @@ class HierarchicalMVCSEMSSATEEncoder(nn.Module):
         self.embed_dim = embed_dim
         self.num_leads = num_leads
         self.pooler_fusion = pooler_fusion
-        self.use_lead_groups = use_lead_groups
+
+        # 处理分组策略（兼容旧参数）
+        if use_lead_groups and lead_group_strategy == 'none':
+            lead_group_strategy = 'limb_chest'
+        self.lead_group_strategy = lead_group_strategy
 
         # ResNet18前端 (全局共享)
         self.resnet = resnet18_frontend(in_channels=1)
@@ -423,8 +445,130 @@ class HierarchicalMVCSEMSSATEEncoder(nn.Module):
 
         # LeadTransformer 和 CrossLeadAggregation
         if pooler_fusion == 'separate':
-            if use_lead_groups:
-                # ========== 分组模式: 每层级×每组 = 6个Transformer + 6个Aggregation ==========
+            if lead_group_strategy == 'lisa':
+                # ========== LISA分组: 每层级×5组 = 15个Transformer + 15个Aggregation ==========
+                # Wave层级 - 5组: lateral, inferior, septal, anterior, avr
+                self.wave_lateral_transformer = LeadTransformer(
+                    embed_dim=embed_dim, depth=lead_transformer_depth,
+                    num_heads=lead_transformer_heads, dim_head=lead_transformer_dim_head,
+                    mlp_ratio=lead_transformer_mlp_ratio, dropout=lead_transformer_dropout,
+                    drop_path=lead_transformer_drop_path, max_len=max_len, use_relative_pos=True
+                )
+                self.wave_inferior_transformer = LeadTransformer(
+                    embed_dim=embed_dim, depth=lead_transformer_depth,
+                    num_heads=lead_transformer_heads, dim_head=lead_transformer_dim_head,
+                    mlp_ratio=lead_transformer_mlp_ratio, dropout=lead_transformer_dropout,
+                    drop_path=lead_transformer_drop_path, max_len=max_len, use_relative_pos=True
+                )
+                self.wave_septal_transformer = LeadTransformer(
+                    embed_dim=embed_dim, depth=lead_transformer_depth,
+                    num_heads=lead_transformer_heads, dim_head=lead_transformer_dim_head,
+                    mlp_ratio=lead_transformer_mlp_ratio, dropout=lead_transformer_dropout,
+                    drop_path=lead_transformer_drop_path, max_len=max_len, use_relative_pos=True
+                )
+                self.wave_anterior_transformer = LeadTransformer(
+                    embed_dim=embed_dim, depth=lead_transformer_depth,
+                    num_heads=lead_transformer_heads, dim_head=lead_transformer_dim_head,
+                    mlp_ratio=lead_transformer_mlp_ratio, dropout=lead_transformer_dropout,
+                    drop_path=lead_transformer_drop_path, max_len=max_len, use_relative_pos=True
+                )
+                self.wave_avr_transformer = LeadTransformer(
+                    embed_dim=embed_dim, depth=lead_transformer_depth,
+                    num_heads=lead_transformer_heads, dim_head=lead_transformer_dim_head,
+                    mlp_ratio=lead_transformer_mlp_ratio, dropout=lead_transformer_dropout,
+                    drop_path=lead_transformer_drop_path, max_len=max_len, use_relative_pos=True
+                )
+                self.wave_lateral_agg = CrossLeadAggregation(embed_dim=embed_dim, depth=1)
+                self.wave_inferior_agg = CrossLeadAggregation(embed_dim=embed_dim, depth=1)
+                self.wave_septal_agg = CrossLeadAggregation(embed_dim=embed_dim, depth=1)
+                self.wave_anterior_agg = CrossLeadAggregation(embed_dim=embed_dim, depth=1)
+                self.wave_avr_agg = CrossLeadAggregation(embed_dim=embed_dim, depth=1)
+                self.wave_group_fusion = nn.Sequential(
+                    nn.Linear(embed_dim * 5, embed_dim), nn.LayerNorm(embed_dim), nn.GELU()
+                )
+
+                # Beat层级 - 5组
+                self.beat_lateral_transformer = LeadTransformer(
+                    embed_dim=embed_dim, depth=lead_transformer_depth,
+                    num_heads=lead_transformer_heads, dim_head=lead_transformer_dim_head,
+                    mlp_ratio=lead_transformer_mlp_ratio, dropout=lead_transformer_dropout,
+                    drop_path=lead_transformer_drop_path, max_len=max_len, use_relative_pos=True
+                )
+                self.beat_inferior_transformer = LeadTransformer(
+                    embed_dim=embed_dim, depth=lead_transformer_depth,
+                    num_heads=lead_transformer_heads, dim_head=lead_transformer_dim_head,
+                    mlp_ratio=lead_transformer_mlp_ratio, dropout=lead_transformer_dropout,
+                    drop_path=lead_transformer_drop_path, max_len=max_len, use_relative_pos=True
+                )
+                self.beat_septal_transformer = LeadTransformer(
+                    embed_dim=embed_dim, depth=lead_transformer_depth,
+                    num_heads=lead_transformer_heads, dim_head=lead_transformer_dim_head,
+                    mlp_ratio=lead_transformer_mlp_ratio, dropout=lead_transformer_dropout,
+                    drop_path=lead_transformer_drop_path, max_len=max_len, use_relative_pos=True
+                )
+                self.beat_anterior_transformer = LeadTransformer(
+                    embed_dim=embed_dim, depth=lead_transformer_depth,
+                    num_heads=lead_transformer_heads, dim_head=lead_transformer_dim_head,
+                    mlp_ratio=lead_transformer_mlp_ratio, dropout=lead_transformer_dropout,
+                    drop_path=lead_transformer_drop_path, max_len=max_len, use_relative_pos=True
+                )
+                self.beat_avr_transformer = LeadTransformer(
+                    embed_dim=embed_dim, depth=lead_transformer_depth,
+                    num_heads=lead_transformer_heads, dim_head=lead_transformer_dim_head,
+                    mlp_ratio=lead_transformer_mlp_ratio, dropout=lead_transformer_dropout,
+                    drop_path=lead_transformer_drop_path, max_len=max_len, use_relative_pos=True
+                )
+                self.beat_lateral_agg = CrossLeadAggregation(embed_dim=embed_dim, depth=1)
+                self.beat_inferior_agg = CrossLeadAggregation(embed_dim=embed_dim, depth=1)
+                self.beat_septal_agg = CrossLeadAggregation(embed_dim=embed_dim, depth=1)
+                self.beat_anterior_agg = CrossLeadAggregation(embed_dim=embed_dim, depth=1)
+                self.beat_avr_agg = CrossLeadAggregation(embed_dim=embed_dim, depth=1)
+                self.beat_group_fusion = nn.Sequential(
+                    nn.Linear(embed_dim * 5, embed_dim), nn.LayerNorm(embed_dim), nn.GELU()
+                )
+
+                # Rhythm层级 - 5组
+                self.rhythm_lateral_transformer = LeadTransformer(
+                    embed_dim=embed_dim, depth=lead_transformer_depth,
+                    num_heads=lead_transformer_heads, dim_head=lead_transformer_dim_head,
+                    mlp_ratio=lead_transformer_mlp_ratio, dropout=lead_transformer_dropout,
+                    drop_path=lead_transformer_drop_path, max_len=max_len, use_relative_pos=True
+                )
+                self.rhythm_inferior_transformer = LeadTransformer(
+                    embed_dim=embed_dim, depth=lead_transformer_depth,
+                    num_heads=lead_transformer_heads, dim_head=lead_transformer_dim_head,
+                    mlp_ratio=lead_transformer_mlp_ratio, dropout=lead_transformer_dropout,
+                    drop_path=lead_transformer_drop_path, max_len=max_len, use_relative_pos=True
+                )
+                self.rhythm_septal_transformer = LeadTransformer(
+                    embed_dim=embed_dim, depth=lead_transformer_depth,
+                    num_heads=lead_transformer_heads, dim_head=lead_transformer_dim_head,
+                    mlp_ratio=lead_transformer_mlp_ratio, dropout=lead_transformer_dropout,
+                    drop_path=lead_transformer_drop_path, max_len=max_len, use_relative_pos=True
+                )
+                self.rhythm_anterior_transformer = LeadTransformer(
+                    embed_dim=embed_dim, depth=lead_transformer_depth,
+                    num_heads=lead_transformer_heads, dim_head=lead_transformer_dim_head,
+                    mlp_ratio=lead_transformer_mlp_ratio, dropout=lead_transformer_dropout,
+                    drop_path=lead_transformer_drop_path, max_len=max_len, use_relative_pos=True
+                )
+                self.rhythm_avr_transformer = LeadTransformer(
+                    embed_dim=embed_dim, depth=lead_transformer_depth,
+                    num_heads=lead_transformer_heads, dim_head=lead_transformer_dim_head,
+                    mlp_ratio=lead_transformer_mlp_ratio, dropout=lead_transformer_dropout,
+                    drop_path=lead_transformer_drop_path, max_len=max_len, use_relative_pos=True
+                )
+                self.rhythm_lateral_agg = CrossLeadAggregation(embed_dim=embed_dim, depth=1)
+                self.rhythm_inferior_agg = CrossLeadAggregation(embed_dim=embed_dim, depth=1)
+                self.rhythm_septal_agg = CrossLeadAggregation(embed_dim=embed_dim, depth=1)
+                self.rhythm_anterior_agg = CrossLeadAggregation(embed_dim=embed_dim, depth=1)
+                self.rhythm_avr_agg = CrossLeadAggregation(embed_dim=embed_dim, depth=1)
+                self.rhythm_group_fusion = nn.Sequential(
+                    nn.Linear(embed_dim * 5, embed_dim), nn.LayerNorm(embed_dim), nn.GELU()
+                )
+
+            elif lead_group_strategy == 'limb_chest':
+                # ========== 肢体/胸导联分组: 每层级×2组 = 6个Transformer + 6个Aggregation ==========
                 # Wave层级
                 self.wave_limb_transformer = LeadTransformer(
                     embed_dim=embed_dim, depth=lead_transformer_depth,
@@ -481,6 +625,7 @@ class HierarchicalMVCSEMSSATEEncoder(nn.Module):
                 self.rhythm_group_fusion = nn.Sequential(
                     nn.Linear(embed_dim * 2, embed_dim), nn.LayerNorm(embed_dim), nn.GELU()
                 )
+
             else:
                 # ========== 无分组模式: 每层级1个Transformer + 1个Aggregation ==========
                 self.wave_transformer = LeadTransformer(
@@ -566,8 +711,83 @@ class HierarchicalMVCSEMSSATEEncoder(nn.Module):
         rhythm_stacked = torch.stack(all_rhythm_feats, dim=1) # (B, 12, n_rhythm, D)
 
         if self.pooler_fusion == 'separate':
-            if self.use_lead_groups:
-                # ========== 分组模式 ==========
+            if self.lead_group_strategy == 'lisa':
+                # ========== LISA分组模式 (5组) ==========
+                # 按LISA解剖分组提取导联
+                wave_lateral = wave_stacked[:, self.LATERAL_LEADS, :, :]    # (B, 4, n_wave, D)
+                wave_inferior = wave_stacked[:, self.INFERIOR_LEADS, :, :]  # (B, 3, n_wave, D)
+                wave_septal = wave_stacked[:, self.SEPTAL_LEADS, :, :]      # (B, 2, n_wave, D)
+                wave_anterior = wave_stacked[:, self.ANTERIOR_LEADS, :, :]  # (B, 2, n_wave, D)
+                wave_avr = wave_stacked[:, self.AVR_LEADS, :, :]            # (B, 1, n_wave, D)
+
+                beat_lateral = beat_stacked[:, self.LATERAL_LEADS, :, :]
+                beat_inferior = beat_stacked[:, self.INFERIOR_LEADS, :, :]
+                beat_septal = beat_stacked[:, self.SEPTAL_LEADS, :, :]
+                beat_anterior = beat_stacked[:, self.ANTERIOR_LEADS, :, :]
+                beat_avr = beat_stacked[:, self.AVR_LEADS, :, :]
+
+                rhythm_lateral = rhythm_stacked[:, self.LATERAL_LEADS, :, :]
+                rhythm_inferior = rhythm_stacked[:, self.INFERIOR_LEADS, :, :]
+                rhythm_septal = rhythm_stacked[:, self.SEPTAL_LEADS, :, :]
+                rhythm_anterior = rhythm_stacked[:, self.ANTERIOR_LEADS, :, :]
+                rhythm_avr = rhythm_stacked[:, self.AVR_LEADS, :, :]
+
+                # Wave层级: 5组独立处理后融合
+                wave_lateral = self.wave_lateral_transformer(wave_lateral)
+                wave_inferior = self.wave_inferior_transformer(wave_inferior)
+                wave_septal = self.wave_septal_transformer(wave_septal)
+                wave_anterior = self.wave_anterior_transformer(wave_anterior)
+                wave_avr = self.wave_avr_transformer(wave_avr)
+
+                wave_lateral_agg, _ = self.wave_lateral_agg(wave_lateral)
+                wave_inferior_agg, _ = self.wave_inferior_agg(wave_inferior)
+                wave_septal_agg, _ = self.wave_septal_agg(wave_septal)
+                wave_anterior_agg, _ = self.wave_anterior_agg(wave_anterior)
+                wave_avr_agg, _ = self.wave_avr_agg(wave_avr)
+
+                wave_agg = self.wave_group_fusion(torch.cat([
+                    wave_lateral_agg, wave_inferior_agg, wave_septal_agg,
+                    wave_anterior_agg, wave_avr_agg
+                ], dim=-1))
+
+                # Beat层级: 5组独立处理后融合
+                beat_lateral = self.beat_lateral_transformer(beat_lateral)
+                beat_inferior = self.beat_inferior_transformer(beat_inferior)
+                beat_septal = self.beat_septal_transformer(beat_septal)
+                beat_anterior = self.beat_anterior_transformer(beat_anterior)
+                beat_avr = self.beat_avr_transformer(beat_avr)
+
+                beat_lateral_agg, _ = self.beat_lateral_agg(beat_lateral)
+                beat_inferior_agg, _ = self.beat_inferior_agg(beat_inferior)
+                beat_septal_agg, _ = self.beat_septal_agg(beat_septal)
+                beat_anterior_agg, _ = self.beat_anterior_agg(beat_anterior)
+                beat_avr_agg, _ = self.beat_avr_agg(beat_avr)
+
+                beat_agg = self.beat_group_fusion(torch.cat([
+                    beat_lateral_agg, beat_inferior_agg, beat_septal_agg,
+                    beat_anterior_agg, beat_avr_agg
+                ], dim=-1))
+
+                # Rhythm层级: 5组独立处理后融合
+                rhythm_lateral = self.rhythm_lateral_transformer(rhythm_lateral)
+                rhythm_inferior = self.rhythm_inferior_transformer(rhythm_inferior)
+                rhythm_septal = self.rhythm_septal_transformer(rhythm_septal)
+                rhythm_anterior = self.rhythm_anterior_transformer(rhythm_anterior)
+                rhythm_avr = self.rhythm_avr_transformer(rhythm_avr)
+
+                rhythm_lateral_agg, _ = self.rhythm_lateral_agg(rhythm_lateral)
+                rhythm_inferior_agg, _ = self.rhythm_inferior_agg(rhythm_inferior)
+                rhythm_septal_agg, _ = self.rhythm_septal_agg(rhythm_septal)
+                rhythm_anterior_agg, _ = self.rhythm_anterior_agg(rhythm_anterior)
+                rhythm_avr_agg, _ = self.rhythm_avr_agg(rhythm_avr)
+
+                rhythm_agg = self.rhythm_group_fusion(torch.cat([
+                    rhythm_lateral_agg, rhythm_inferior_agg, rhythm_septal_agg,
+                    rhythm_anterior_agg, rhythm_avr_agg
+                ], dim=-1))
+
+            elif self.lead_group_strategy == 'limb_chest':
+                # ========== 肢体/胸导联分组模式 (2组) ==========
                 # 分离肢体导联和胸导联
                 wave_limb = wave_stacked[:, self.LIMB_LEADS, :, :]      # (B, 6, n_wave, D)
                 wave_chest = wave_stacked[:, self.CHEST_LEADS, :, :]    # (B, 6, n_wave, D)
@@ -748,9 +968,82 @@ class HierarchicalMVCSEMSSATEEncoder(nn.Module):
 
         # LeadTransformer + CrossLeadAggregation
         if self.pooler_fusion == 'separate':
-            if self.use_lead_groups:
-                # ========== 分组模式 ==========
-                # 分离肢体导联和胸导联
+            if self.lead_group_strategy == 'lisa':
+                # ========== LISA分组模式 (5组) ==========
+                wave_lateral = wave_stacked[:, self.LATERAL_LEADS, :, :]
+                wave_inferior = wave_stacked[:, self.INFERIOR_LEADS, :, :]
+                wave_septal = wave_stacked[:, self.SEPTAL_LEADS, :, :]
+                wave_anterior = wave_stacked[:, self.ANTERIOR_LEADS, :, :]
+                wave_avr = wave_stacked[:, self.AVR_LEADS, :, :]
+
+                beat_lateral = beat_stacked[:, self.LATERAL_LEADS, :, :]
+                beat_inferior = beat_stacked[:, self.INFERIOR_LEADS, :, :]
+                beat_septal = beat_stacked[:, self.SEPTAL_LEADS, :, :]
+                beat_anterior = beat_stacked[:, self.ANTERIOR_LEADS, :, :]
+                beat_avr = beat_stacked[:, self.AVR_LEADS, :, :]
+
+                rhythm_lateral = rhythm_stacked[:, self.LATERAL_LEADS, :, :]
+                rhythm_inferior = rhythm_stacked[:, self.INFERIOR_LEADS, :, :]
+                rhythm_septal = rhythm_stacked[:, self.SEPTAL_LEADS, :, :]
+                rhythm_anterior = rhythm_stacked[:, self.ANTERIOR_LEADS, :, :]
+                rhythm_avr = rhythm_stacked[:, self.AVR_LEADS, :, :]
+
+                # Wave层级
+                wave_lateral = self.wave_lateral_transformer(wave_lateral)
+                wave_inferior = self.wave_inferior_transformer(wave_inferior)
+                wave_septal = self.wave_septal_transformer(wave_septal)
+                wave_anterior = self.wave_anterior_transformer(wave_anterior)
+                wave_avr = self.wave_avr_transformer(wave_avr)
+
+                wave_lateral_agg, _ = self.wave_lateral_agg(wave_lateral)
+                wave_inferior_agg, _ = self.wave_inferior_agg(wave_inferior)
+                wave_septal_agg, _ = self.wave_septal_agg(wave_septal)
+                wave_anterior_agg, _ = self.wave_anterior_agg(wave_anterior)
+                wave_avr_agg, _ = self.wave_avr_agg(wave_avr)
+
+                wave_agg = self.wave_group_fusion(torch.cat([
+                    wave_lateral_agg, wave_inferior_agg, wave_septal_agg,
+                    wave_anterior_agg, wave_avr_agg
+                ], dim=-1))
+
+                # Beat层级
+                beat_lateral = self.beat_lateral_transformer(beat_lateral)
+                beat_inferior = self.beat_inferior_transformer(beat_inferior)
+                beat_septal = self.beat_septal_transformer(beat_septal)
+                beat_anterior = self.beat_anterior_transformer(beat_anterior)
+                beat_avr = self.beat_avr_transformer(beat_avr)
+
+                beat_lateral_agg, _ = self.beat_lateral_agg(beat_lateral)
+                beat_inferior_agg, _ = self.beat_inferior_agg(beat_inferior)
+                beat_septal_agg, _ = self.beat_septal_agg(beat_septal)
+                beat_anterior_agg, _ = self.beat_anterior_agg(beat_anterior)
+                beat_avr_agg, _ = self.beat_avr_agg(beat_avr)
+
+                beat_agg = self.beat_group_fusion(torch.cat([
+                    beat_lateral_agg, beat_inferior_agg, beat_septal_agg,
+                    beat_anterior_agg, beat_avr_agg
+                ], dim=-1))
+
+                # Rhythm层级
+                rhythm_lateral = self.rhythm_lateral_transformer(rhythm_lateral)
+                rhythm_inferior = self.rhythm_inferior_transformer(rhythm_inferior)
+                rhythm_septal = self.rhythm_septal_transformer(rhythm_septal)
+                rhythm_anterior = self.rhythm_anterior_transformer(rhythm_anterior)
+                rhythm_avr = self.rhythm_avr_transformer(rhythm_avr)
+
+                rhythm_lateral_agg, _ = self.rhythm_lateral_agg(rhythm_lateral)
+                rhythm_inferior_agg, _ = self.rhythm_inferior_agg(rhythm_inferior)
+                rhythm_septal_agg, _ = self.rhythm_septal_agg(rhythm_septal)
+                rhythm_anterior_agg, _ = self.rhythm_anterior_agg(rhythm_anterior)
+                rhythm_avr_agg, _ = self.rhythm_avr_agg(rhythm_avr)
+
+                rhythm_agg = self.rhythm_group_fusion(torch.cat([
+                    rhythm_lateral_agg, rhythm_inferior_agg, rhythm_septal_agg,
+                    rhythm_anterior_agg, rhythm_avr_agg
+                ], dim=-1))
+
+            elif self.lead_group_strategy == 'limb_chest':
+                # ========== 肢体/胸导联分组模式 (2组) ==========
                 wave_limb = wave_stacked[:, self.LIMB_LEADS, :, :]
                 wave_chest = wave_stacked[:, self.CHEST_LEADS, :, :]
                 beat_limb = beat_stacked[:, self.LIMB_LEADS, :, :]
@@ -808,7 +1101,7 @@ class HierarchicalMVCSEMSSATEEncoder(nn.Module):
             f'embed_dim={self.embed_dim}, num_leads={self.num_leads}, '
             f'queries=(wave={self.n_wave_queries}, beat={self.n_beat_queries}, '
             f'rhythm={self.n_rhythm_queries}), fusion={self.pooler_fusion}, '
-            f'use_lead_groups={self.use_lead_groups}'
+            f'lead_group_strategy={self.lead_group_strategy}'
         )
 
 
