@@ -81,8 +81,10 @@ class MVCSEMSSATEModel(BasePretrainModel):
         # 跨尺度对比参数
         cross_scale_weight: float = 1.0,
         cross_scale_temperature: float = 0.1,
-        # 可学习相似度参数
+        # 语义增强参数（FNM Loss）
         use_learnable_sim: bool = True,
+        fnm_weight: float = 0.5,  # False Negative Mitigation Loss 权重
+        # 以下参数保留兼容性，但不再使用
         init_sim_alpha: float = 0.0,
         init_threshold: float = 3.0,
         init_soft_weight: float = -3.0,
@@ -121,6 +123,8 @@ class MVCSEMSSATEModel(BasePretrainModel):
         # 跨尺度对比参数
         self.cross_scale_weight = cross_scale_weight
         self.cross_scale_temperature = cross_scale_temperature
+        # FNM Loss 参数
+        self.fnm_weight = fnm_weight
 
         super().__init__(
             ecg_encoder_name=ecg_encoder_name,
@@ -312,7 +316,7 @@ class MVCSEMSSATEModel(BasePretrainModel):
                 nn.LayerNorm(self.proj_out)
             )
 
-            # 简单的ClipLoss
+            # 简单的ClipLoss (用于wave和beat尺度)
             self.clip_loss = ClipLoss(
                 local_loss=True,
                 gather_with_grad=True,
@@ -320,6 +324,15 @@ class MVCSEMSSATEModel(BasePretrainModel):
                 rank=0,
                 world_size=1,
             )
+
+            # Rhythm尺度使用LearnableSoftClipLoss（只有rhythm用软标签）
+            if self.use_learnable_sim:
+                self.rhythm_soft_clip_loss = LearnableSoftClipLoss(
+                    local_loss=True,
+                    gather_with_grad=True,
+                    rank=0,
+                    world_size=1,
+                )
         else:
             # 单尺度模式：原有投影
             self.proj_t = nn.Sequential(
@@ -641,6 +654,56 @@ class MVCSEMSSATEModel(BasePretrainModel):
 
         return (loss_wb + loss_wr + loss_br) / 3
 
+    def false_negative_mitigation_loss(
+        self,
+        ecg_z: torch.Tensor,
+        text_z: torch.Tensor
+    ) -> torch.Tensor:
+        """
+        假负样本缓解损失 (False Negative Mitigation Loss)
+
+        参考 FG-CLEP 论文:
+        L_fnm = (1/B) * Σ_i Σ_j |sim(ecg_i, text_j) - S_ij|
+
+        其中 S_ij 是文本间的语义相似度矩阵。
+        这个损失鼓励 ECG-Text 的跨模态相似度接近文本间的语义相似度。
+
+        Args:
+            ecg_z: (B, D) 投影后的 ECG 特征（已 L2 归一化）
+            text_z: (B, D) 投影后的文本特征（已 L2 归一化）
+
+        Returns:
+            loss: FNM 损失
+        """
+        # 文本语义相似度矩阵（用投影后的文本嵌入）
+        if torch.distributed.is_initialized() and torch.distributed.get_world_size() > 1:
+            world_size = torch.distributed.get_world_size()
+
+            # Gather 投影后的文本嵌入
+            gathered_text = [torch.zeros_like(text_z) for _ in range(world_size)]
+            torch.distributed.all_gather(gathered_text, text_z.contiguous())
+            all_text_z = torch.cat(gathered_text, dim=0)
+
+            # Gather ECG 嵌入
+            gathered_ecg = [torch.zeros_like(ecg_z) for _ in range(world_size)]
+            torch.distributed.all_gather(gathered_ecg, ecg_z.contiguous())
+            all_ecg_z = torch.cat(gathered_ecg, dim=0)
+
+            # 文本语义相似度: (local_batch, global_batch)
+            S = text_z @ all_text_z.T
+
+            # ECG-Text 跨模态相似度: (local_batch, global_batch)
+            cross_sim = ecg_z @ all_text_z.T
+        else:
+            # 单卡模式
+            S = text_z @ text_z.T  # (B, B)
+            cross_sim = ecg_z @ text_z.T  # (B, B)
+
+        # L1 距离: 让跨模态相似度接近文本语义相似度
+        loss = torch.abs(cross_sim - S).mean()
+
+        return loss
+
     def shared_step(self, batch, batch_idx):
         """训练步骤"""
         # ECG编码
@@ -653,7 +716,7 @@ class MVCSEMSSATEModel(BasePretrainModel):
         text_output = self.encode_text(input_ids, attention_mask)
 
         if self.use_multiscale:
-            # ========== 简单多尺度对比学习：三个尺度loss相加 ==========
+            # ========== 多尺度对比学习：wave/beat硬标签，rhythm软标签 ==========
             # 更新分布式参数
             rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
             world_size = torch.distributed.get_world_size() if torch.distributed.is_initialized() else 1
@@ -671,20 +734,31 @@ class MVCSEMSSATEModel(BasePretrainModel):
             text_beat_z = F.normalize(self.text_beat_proj(text_emb), dim=-1)
             text_rhythm_z = F.normalize(self.text_rhythm_proj(text_emb), dim=-1)
 
-            # 三个尺度的ECG-Text ClipLoss
             logit_scale = self.logit_scale.exp()
+
+            # Wave/Beat/Rhythm: 全部使用硬标签 ClipLoss
             loss_wave = self.clip_loss(wave_z, text_wave_z, logit_scale)
             loss_beat = self.clip_loss(beat_z, text_beat_z, logit_scale)
             loss_rhythm = self.clip_loss(rhythm_z, text_rhythm_z, logit_scale)
 
-            # 总损失 = 三个尺度loss相加
-            total_loss = loss_wave + loss_beat + loss_rhythm
+            # 对比学习主损失
+            loss_clip = loss_wave + loss_beat + loss_rhythm
+
+            # Rhythm 尺度: 添加 FNM Loss (假负样本缓解损失)
+            if self.use_learnable_sim and self.fnm_weight > 0:
+                loss_fnm = self.false_negative_mitigation_loss(rhythm_z, text_rhythm_z)
+            else:
+                loss_fnm = torch.tensor(0.0, device=wave_z.device)
+
+            # 总损失 = 对比学习损失 + FNM 损失
+            total_loss = loss_clip + self.fnm_weight * loss_fnm
 
             loss_dict = {
                 'loss': total_loss,
                 'loss_wave': loss_wave,
                 'loss_beat': loss_beat,
                 'loss_rhythm': loss_rhythm,
+                'loss_fnm': loss_fnm,
                 'logit_scale': logit_scale,
             }
         else:

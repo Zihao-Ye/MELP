@@ -137,6 +137,7 @@ def main(hparams: Namespace):
         shared_emb_dim=hparams.shared_emb_dim,
         # 对比学习参数
         use_learnable_sim=hparams.use_learnable_sim,
+        fnm_weight=hparams.fnm_weight,
         # 跨尺度对比参数
         cross_scale_weight=hparams.cross_scale_weight,
         cross_scale_temperature=hparams.cross_scale_temperature,
@@ -216,9 +217,11 @@ if __name__ == '__main__':
 
     # 对比学习参数
     parser.add_argument("--use_learnable_sim", action="store_true", default=True,
-                        help="Use learnable similarity for soft labels")
+                        help="Enable FNM (False Negative Mitigation) loss")
     parser.add_argument("--no_learnable_sim", action="store_false", dest="use_learnable_sim",
-                        help="Disable learnable similarity")
+                        help="Disable FNM loss")
+    parser.add_argument("--fnm_weight", type=float, default=0.5,
+                        help="Weight for False Negative Mitigation loss (FG-CLEP style)")
 
     # 跨尺度对比参数
     parser.add_argument("--cross_scale_weight", type=float, default=0.0,

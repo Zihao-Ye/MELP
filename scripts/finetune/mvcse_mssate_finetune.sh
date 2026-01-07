@@ -5,7 +5,7 @@
 
 # ============ 配置区域 ============
 # 设置预训练模型的checkpoint路径
-CKPT_PATH="~/autodl-tmp/logs/mvcse_mssate/ckpts/mvcse_mssate_hierarchical_mvcse_mssate_base_2026_01_06_00_11_25/epoch=1-step=5824.ckpt"
+CKPT_PATH="~/autodl-tmp/logs/mvcse_mssate/ckpts/mvcse_mssate_hierarchical_mvcse_mssate_base_2026_01_06_13_59_00/epoch=1-step=5824.ckpt"
 # 微调模式: linear_probe (冻结backbone) 或 full_finetune (全微调)
 FINETUNE_MODE="linear_probe"
 # ==================================
