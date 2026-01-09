@@ -35,6 +35,7 @@ from melp.backbone.mvcse_mssate import (
     hierarchical_mvcse_mssate_large
 )
 from melp.models.base_pretrain_model import BasePretrainModel
+from melp.models.diagnosis_generator import MultiScaleDiagnosisGenerator
 from melp.utils.openclip_loss import (
     ClipLoss, SoftClipLoss, LearnableSoftClipLoss,
     MultiScaleClipLoss, MultiScaleSemanticEnhancedClipLoss,
@@ -88,6 +89,13 @@ class MVCSEMSSATEModel(BasePretrainModel):
         init_sim_alpha: float = 0.0,
         init_threshold: float = 3.0,
         init_soft_weight: float = -3.0,
+        # 诊断生成器参数
+        use_diagnosis_generator: bool = False,
+        generator_layers: int = 6,
+        generator_heads: int = 8,
+        generator_dim: int = 768,
+        generator_dropout: float = 0.1,
+        caption_loss_weight: float = 1.0,
         # 优化器参数
         lr: float = 2e-4,
         weight_decay: float = 0.2,
@@ -126,6 +134,14 @@ class MVCSEMSSATEModel(BasePretrainModel):
         # FNM Loss 参数
         self.fnm_weight = fnm_weight
 
+        # 诊断生成器参数
+        self.use_diagnosis_generator = use_diagnosis_generator
+        self.generator_layers = generator_layers
+        self.generator_heads = generator_heads
+        self.generator_dim = generator_dim
+        self.generator_dropout = generator_dropout
+        self.caption_loss_weight = caption_loss_weight
+
         super().__init__(
             ecg_encoder_name=ecg_encoder_name,
             text_encoder_name=text_encoder_name,
@@ -145,6 +161,10 @@ class MVCSEMSSATEModel(BasePretrainModel):
         # 初始化编码器
         self.init_ecg_encoder()
         self.init_text_encoder()
+
+        # 初始化诊断生成器（如果启用）
+        if self.use_diagnosis_generator and self.use_multiscale:
+            self.init_diagnosis_generator()
 
         # 对比学习温度参数
         lshape = []
@@ -260,15 +280,9 @@ class MVCSEMSSATEModel(BasePretrainModel):
             )
 
     def init_text_encoder(self):
-        """初始化文本编码器（与MERL保持一致）"""
+        """初始化文本编码器（完全冻结，作为特征提取器）"""
         if self.text_encoder_name == "ncbi/MedCPT-Query-Encoder":
             self.lm_model = AutoModel.from_pretrained(self.text_encoder_name)
-
-            # 冻结前几层
-            for layer_idx in range(self.num_freeze_layers):
-                for param in list(self.lm_model.encoder.layer[layer_idx].parameters()):
-                    param.requires_grad = False
-
             text_encoder_hidden_dim = 768
 
         elif self.text_encoder_name == "google/flan-t5-small":
@@ -283,6 +297,10 @@ class MVCSEMSSATEModel(BasePretrainModel):
 
         else:
             raise NotImplementedError(f"Unknown text encoder: {self.text_encoder_name}")
+
+        # 完全冻结文本编码器
+        for param in self.lm_model.parameters():
+            param.requires_grad = False
 
         self.text_encoder_hidden_dim = text_encoder_hidden_dim
 
@@ -342,6 +360,23 @@ class MVCSEMSSATEModel(BasePretrainModel):
             )
 
         self.tokenizer = AutoTokenizer.from_pretrained(self.text_encoder_name)
+
+    def init_diagnosis_generator(self):
+        """初始化多尺度诊断生成器"""
+        self.diagnosis_generator = MultiScaleDiagnosisGenerator(
+            vocab_size=self.tokenizer.vocab_size,
+            max_seq_len=128,
+            d_model=self.generator_dim,
+            ecg_dim=self.ecg_out_dim,
+            n_layers=self.generator_layers,
+            n_heads=self.generator_heads,
+            mlp_ratio=4.0,
+            dropout=self.generator_dropout,
+            use_scale_gate=True,
+            pad_token_id=self.tokenizer.pad_token_id,
+            bos_token_id=self.tokenizer.cls_token_id,  # BERT用[CLS]作为开始
+            eos_token_id=self.tokenizer.sep_token_id   # BERT用[SEP]作为结束
+        )
 
     def _tokenize(self, text):
         """文本分词"""
@@ -743,24 +778,42 @@ class MVCSEMSSATEModel(BasePretrainModel):
 
             # 对比学习主损失
             loss_clip = loss_wave + loss_beat + loss_rhythm
-
-            # Rhythm 尺度: 添加 FNM Loss (假负样本缓解损失)
-            if self.use_learnable_sim and self.fnm_weight > 0:
-                loss_fnm = self.false_negative_mitigation_loss(rhythm_z, text_rhythm_z)
-            else:
-                loss_fnm = torch.tensor(0.0, device=wave_z.device)
-
-            # 总损失 = 对比学习损失 + FNM 损失
-            total_loss = loss_clip + self.fnm_weight * loss_fnm
+            total_loss = loss_clip
 
             loss_dict = {
                 'loss': total_loss,
                 'loss_wave': loss_wave,
                 'loss_beat': loss_beat,
                 'loss_rhythm': loss_rhythm,
-                'loss_fnm': loss_fnm,
                 'logit_scale': logit_scale,
             }
+
+            # ========== 诊断生成损失（如果启用）==========
+            if self.use_diagnosis_generator:
+                # 获取序列特征（需要用forward_for_generation）
+                ecg_gen_feats = self.ecg_encoder.forward_for_generation(batch['ecg'])
+
+                # 生成器前向传播
+                gen_output = self.diagnosis_generator(
+                    input_ids=input_ids,
+                    wave_seq=ecg_gen_feats['wave_seq'],
+                    beat_seq=ecg_gen_feats['beat_seq'],
+                    rhythm_seq=ecg_gen_feats['rhythm_seq'],
+                    labels=input_ids  # Teacher forcing
+                )
+
+                loss_caption = gen_output['loss']
+                total_loss = total_loss + self.caption_loss_weight * loss_caption
+
+                loss_dict['loss'] = total_loss
+                loss_dict['loss_caption'] = loss_caption
+
+                # 记录尺度注意力统计（用于分析）
+                if 'scale_weights' in gen_output:
+                    scale_weights = gen_output['scale_weights'].mean(dim=(0, 1))  # (3,)
+                    loss_dict['scale_attn_wave'] = scale_weights[0]
+                    loss_dict['scale_attn_beat'] = scale_weights[1]
+                    loss_dict['scale_attn_rhythm'] = scale_weights[2]
         else:
             # ========== 单尺度对比学习（原有逻辑）==========
             loss_fn = ClipLoss(

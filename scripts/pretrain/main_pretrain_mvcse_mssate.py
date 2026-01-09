@@ -141,6 +141,13 @@ def main(hparams: Namespace):
         # 跨尺度对比参数
         cross_scale_weight=hparams.cross_scale_weight,
         cross_scale_temperature=hparams.cross_scale_temperature,
+        # 诊断生成器参数
+        use_diagnosis_generator=hparams.use_diagnosis_generator,
+        generator_layers=hparams.generator_layers,
+        generator_heads=hparams.generator_heads,
+        generator_dim=hparams.generator_dim,
+        generator_dropout=hparams.generator_dropout,
+        caption_loss_weight=hparams.caption_loss_weight,
         # 优化器参数
         lr=hparams.lr,
         weight_decay=hparams.weight_decay,
@@ -228,6 +235,22 @@ if __name__ == '__main__':
                         help="Weight for cross-scale contrastive loss (0 to disable)")
     parser.add_argument("--cross_scale_temperature", type=float, default=0.1,
                         help="Temperature for cross-scale contrastive loss")
+
+    # 诊断生成器参数
+    parser.add_argument("--use_diagnosis_generator", action="store_true", default=True,
+                        help="Enable diagnosis generator for caption loss")
+    parser.add_argument("--no_diagnosis_generator", action="store_false", dest="use_diagnosis_generator",
+                        help="Disable diagnosis generator")
+    parser.add_argument("--generator_layers", type=int, default=6,
+                        help="Number of transformer layers in diagnosis generator")
+    parser.add_argument("--generator_heads", type=int, default=8,
+                        help="Number of attention heads in diagnosis generator")
+    parser.add_argument("--generator_dim", type=int, default=768,
+                        help="Hidden dimension of diagnosis generator")
+    parser.add_argument("--generator_dropout", type=float, default=0.1,
+                        help="Dropout rate in diagnosis generator")
+    parser.add_argument("--caption_loss_weight", type=float, default=1.0,
+                        help="Weight for caption generation loss")
 
     # 训练参数
     parser.add_argument("--seed", type=int, default=42)

@@ -137,12 +137,6 @@ class MERLModel(BasePretrainModel):
         if self.text_encoder_name == "ncbi/MedCPT-Query-Encoder":
             self.lm_model = AutoModel.from_pretrained(
                 self.text_encoder_name)
-
-            # freeze layers
-            for layer_idx in range(self.num_freeze_layers):
-                for param in list(self.lm_model.encoder.layer[layer_idx].parameters()):
-                    param.requires_grad = False
-
             text_encoder_hidden_dim = 768
         elif self.text_encoder_name == "google/flan-t5-small":
             self.lm_model = T5EncoderModel.from_pretrained(
@@ -154,6 +148,11 @@ class MERLModel(BasePretrainModel):
             text_encoder_hidden_dim = 768
         else:
             raise NotImplementedError
+
+        # 完全冻结文本编码器
+        for param in self.lm_model.parameters():
+            param.requires_grad = False
+
         # text projector
         self.proj_t = nn.Sequential(
             nn.Linear(text_encoder_hidden_dim, self.proj_hidden),
@@ -378,121 +377,47 @@ class MERLModel(BasePretrainModel):
         return hybrid_sim, alpha
 
     def shared_step(self, batch, batch_idx):
-        # only used in training_step now
+        # ECG 编码
         ecg_output = self.encode_ecg(batch['ecg'])
 
+        # Text 编码
         tokenized_input = self._tokenize(batch['report'])
         input_ids = tokenized_input['input_ids'].type_as(batch['ecg']).long()
         attention_mask = tokenized_input['attention_mask'].type_as(batch['ecg']).long()
         text_output = self.encode_text(input_ids, attention_mask)
 
-        # write infonce loss for lightning
-        loss = ClipLoss(
+        # ClipLoss
+        clip_loss_fn = ClipLoss(
             local_loss=True,
             gather_with_grad=True,
             cache_labels=True,
-            rank=torch.distributed.get_rank(),
-            world_size=torch.distributed.get_world_size(),
+            rank=torch.distributed.get_rank() if torch.distributed.is_initialized() else 0,
+            world_size=torch.distributed.get_world_size() if torch.distributed.is_initialized() else 1,
             use_horovod=False
         )
 
-        # Original hard-label CMA loss (commented out)
-        # cma_loss = loss(
-        #     ecg_output['proj_ecg_emb'], text_output['proj_text_emb'], self.logit_scale.exp())
+        # CMA Loss: ECG-Text 跨模态对齐
+        cma_loss = clip_loss_fn(
+            ecg_output['proj_ecg_emb'],
+            text_output['proj_text_emb'],
+            self.logit_scale.exp()
+        )
 
-        # # ========== 固定相似度方案 (已注释) ==========
-        # # Compute text similarity matrix using medical LM embeddings (MedCPT, etc.)
-        # # This provides stable semantic similarity based on medical knowledge
-        # text_sim_matrix = self.compute_text_similarity(batch['report'])
-
-        # # Soft-label CMA (Cross-Modal Alignment) loss
-        # soft_clip_loss = SoftClipLoss(
-        #     similarity_threshold=0.95,
-        #     soft_positive_weight=0.05,
-        #     local_loss=True,
-        #     gather_with_grad=True,
-        #     cache_labels=False,
-        #     rank=torch.distributed.get_rank(),
-        #     world_size=torch.distributed.get_world_size(),
-        #     use_horovod=False
-        # )
-
-        # soft_cma_loss = soft_clip_loss(
-        #     image_features=ecg_output['proj_ecg_emb'],
-        #     text_features=text_output['proj_text_emb'],
-        #     logit_scale=self.logit_scale.exp(),
-        #     text_sim_matrix=text_sim_matrix
-        # )
-
-        # ========== 可学习相似度方案 ==========
-        if self.use_learnable_sim:
-            # 计算混合相似度矩阵
-            hybrid_sim, alpha = self.compute_hybrid_similarity(
-                text_output['proj_text_emb'],  # 可学习 (经过 proj_t)
-                text_output['text_emb']         # 固定 (原始 LM 嵌入)
-            )
-
-            # 使用可学习的软标签损失
-            learnable_soft_loss_fn = LearnableSoftClipLoss(
-                local_loss=True,
-                gather_with_grad=True,
-                rank=torch.distributed.get_rank(),
-                world_size=torch.distributed.get_world_size(),
-                use_horovod=False
-            )
-
-            soft_cma_loss = learnable_soft_loss_fn(
-                image_features=ecg_output['proj_ecg_emb'],
-                text_features=text_output['proj_text_emb'],
-                logit_scale=self.logit_scale.exp(),
-                sim_matrix=hybrid_sim,
-                threshold=self.learnable_threshold,
-                soft_weight=self.learnable_soft_weight,
-            )
-        else:
-            # 固定相似度方案 (fallback)
-            text_sim_matrix = self.compute_text_similarity(batch['report'])
-
-            soft_clip_loss_fn = SoftClipLoss(
-                similarity_threshold=0.95,
-                soft_positive_weight=0.05,
-                local_loss=True,
-                gather_with_grad=True,
-                cache_labels=False,
-                rank=torch.distributed.get_rank(),
-                world_size=torch.distributed.get_world_size(),
-                use_horovod=False
-            )
-
-            soft_cma_loss = soft_clip_loss_fn(
-                image_features=ecg_output['proj_ecg_emb'],
-                text_features=text_output['proj_text_emb'],
-                logit_scale=self.logit_scale.exp(),
-                text_sim_matrix=text_sim_matrix
-            )
-
-        uma_loss = loss(
-            ecg_output['ecg_emb1'], ecg_output['ecg_emb2'], torch.tensor(1 / 0.07))
+        # UMA Loss: ECG 单模态自监督对比
+        uma_loss = clip_loss_fn(
+            ecg_output['ecg_emb1'],
+            ecg_output['ecg_emb2'],
+            torch.tensor(1 / 0.07).type_as(ecg_output['ecg_emb1'])
+        )
 
         loss_dict = {
-            'loss': soft_cma_loss + uma_loss,
-            'soft_cma_loss': soft_cma_loss,
-            'uma_loss': uma_loss
+            'loss': cma_loss + uma_loss,
+            'cma_loss': cma_loss,
+            'uma_loss': uma_loss,
+            'logit_scale': self.logit_scale.exp()
         }
 
-        # 记录可学习参数的当前值 (用于监控训练过程)
-        if self.use_learnable_sim:
-            loss_dict['sim_alpha'] = alpha.detach()
-            loss_dict['threshold'] = torch.sigmoid(self.learnable_threshold).detach()
-            loss_dict['soft_weight'] = torch.sigmoid(self.learnable_soft_weight).detach()
-
-        # don't write metrics for now
         metrics_dict = {}
-        # metrics_dict = {
-        #     'acc1': acc1,
-        #     'acc5': acc5
-        # }
-
         return loss_dict, metrics_dict
 
     def on_train_batch_end(self, *args, **kwargs) -> None:

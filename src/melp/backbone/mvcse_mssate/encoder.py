@@ -931,6 +931,182 @@ class HierarchicalMVCSEMSSATEEncoder(nn.Module):
             'output': output
         }
 
+    def forward_for_generation(self, x: torch.Tensor) -> Dict[str, torch.Tensor]:
+        """
+        返回三个尺度的序列特征（池化前），用于诊断生成任务。
+
+        诊断生成需要细粒度的序列特征，而非池化后的单向量。
+        不同尺度的token数量不同，对应不同的时间粒度：
+        - wave: 30个token，对应波形级别（P/QRS/T波）
+        - beat: 10个token，对应心拍级别
+        - rhythm: 3个token，对应节律级别
+
+        Args:
+            x: (B, 12, L) - 12导联ECG信号
+
+        Returns:
+            Dict containing:
+            - 'wave_seq': (B, 30, D) 波段级序列特征
+            - 'beat_seq': (B, 10, D) 心拍级序列特征
+            - 'rhythm_seq': (B, 3, D) 节律级序列特征
+            - 'wave': (B, D) 波段级池化特征
+            - 'beat': (B, D) 心拍级池化特征
+            - 'rhythm': (B, D) 节律级池化特征
+        """
+        B = x.shape[0]
+
+        all_wave_feats = []
+        all_beat_feats = []
+        all_rhythm_feats = []
+
+        for lead_idx in range(self.num_leads):
+            lead_signal = x[:, lead_idx:lead_idx+1, :]
+            lead_feat = self.resnet(lead_signal)
+            lead_feat = rearrange(lead_feat, 'b c n -> b n c')
+
+            pooler_out = self.hierarchical_pooler(lead_feat)
+
+            all_wave_feats.append(pooler_out['wave_features'])
+            all_beat_feats.append(pooler_out['beat_features'])
+            all_rhythm_feats.append(pooler_out['rhythm_features'])
+
+        # 堆叠12导联
+        wave_stacked = torch.stack(all_wave_feats, dim=1)
+        beat_stacked = torch.stack(all_beat_feats, dim=1)
+        rhythm_stacked = torch.stack(all_rhythm_feats, dim=1)
+
+        # LeadTransformer + CrossLeadAggregation
+        if self.pooler_fusion == 'separate':
+            if self.lead_group_strategy == 'lisa':
+                # LISA分组模式
+                wave_lateral = wave_stacked[:, self.LATERAL_LEADS, :, :]
+                wave_inferior = wave_stacked[:, self.INFERIOR_LEADS, :, :]
+                wave_septal = wave_stacked[:, self.SEPTAL_LEADS, :, :]
+                wave_anterior = wave_stacked[:, self.ANTERIOR_LEADS, :, :]
+                wave_avr = wave_stacked[:, self.AVR_LEADS, :, :]
+
+                beat_lateral = beat_stacked[:, self.LATERAL_LEADS, :, :]
+                beat_inferior = beat_stacked[:, self.INFERIOR_LEADS, :, :]
+                beat_septal = beat_stacked[:, self.SEPTAL_LEADS, :, :]
+                beat_anterior = beat_stacked[:, self.ANTERIOR_LEADS, :, :]
+                beat_avr = beat_stacked[:, self.AVR_LEADS, :, :]
+
+                rhythm_lateral = rhythm_stacked[:, self.LATERAL_LEADS, :, :]
+                rhythm_inferior = rhythm_stacked[:, self.INFERIOR_LEADS, :, :]
+                rhythm_septal = rhythm_stacked[:, self.SEPTAL_LEADS, :, :]
+                rhythm_anterior = rhythm_stacked[:, self.ANTERIOR_LEADS, :, :]
+                rhythm_avr = rhythm_stacked[:, self.AVR_LEADS, :, :]
+
+                # Wave层级
+                wave_lateral = self.wave_lateral_transformer(wave_lateral)
+                wave_inferior = self.wave_inferior_transformer(wave_inferior)
+                wave_septal = self.wave_septal_transformer(wave_septal)
+                wave_anterior = self.wave_anterior_transformer(wave_anterior)
+                wave_avr = self.wave_avr_transformer(wave_avr)
+
+                wave_lateral_agg, _ = self.wave_lateral_agg(wave_lateral)
+                wave_inferior_agg, _ = self.wave_inferior_agg(wave_inferior)
+                wave_septal_agg, _ = self.wave_septal_agg(wave_septal)
+                wave_anterior_agg, _ = self.wave_anterior_agg(wave_anterior)
+                wave_avr_agg, _ = self.wave_avr_agg(wave_avr)
+
+                wave_agg = self.wave_group_fusion(torch.cat([
+                    wave_lateral_agg, wave_inferior_agg, wave_septal_agg,
+                    wave_anterior_agg, wave_avr_agg
+                ], dim=-1))
+
+                # Beat层级
+                beat_lateral = self.beat_lateral_transformer(beat_lateral)
+                beat_inferior = self.beat_inferior_transformer(beat_inferior)
+                beat_septal = self.beat_septal_transformer(beat_septal)
+                beat_anterior = self.beat_anterior_transformer(beat_anterior)
+                beat_avr = self.beat_avr_transformer(beat_avr)
+
+                beat_lateral_agg, _ = self.beat_lateral_agg(beat_lateral)
+                beat_inferior_agg, _ = self.beat_inferior_agg(beat_inferior)
+                beat_septal_agg, _ = self.beat_septal_agg(beat_septal)
+                beat_anterior_agg, _ = self.beat_anterior_agg(beat_anterior)
+                beat_avr_agg, _ = self.beat_avr_agg(beat_avr)
+
+                beat_agg = self.beat_group_fusion(torch.cat([
+                    beat_lateral_agg, beat_inferior_agg, beat_septal_agg,
+                    beat_anterior_agg, beat_avr_agg
+                ], dim=-1))
+
+                # Rhythm层级
+                rhythm_lateral = self.rhythm_lateral_transformer(rhythm_lateral)
+                rhythm_inferior = self.rhythm_inferior_transformer(rhythm_inferior)
+                rhythm_septal = self.rhythm_septal_transformer(rhythm_septal)
+                rhythm_anterior = self.rhythm_anterior_transformer(rhythm_anterior)
+                rhythm_avr = self.rhythm_avr_transformer(rhythm_avr)
+
+                rhythm_lateral_agg, _ = self.rhythm_lateral_agg(rhythm_lateral)
+                rhythm_inferior_agg, _ = self.rhythm_inferior_agg(rhythm_inferior)
+                rhythm_septal_agg, _ = self.rhythm_septal_agg(rhythm_septal)
+                rhythm_anterior_agg, _ = self.rhythm_anterior_agg(rhythm_anterior)
+                rhythm_avr_agg, _ = self.rhythm_avr_agg(rhythm_avr)
+
+                rhythm_agg = self.rhythm_group_fusion(torch.cat([
+                    rhythm_lateral_agg, rhythm_inferior_agg, rhythm_septal_agg,
+                    rhythm_anterior_agg, rhythm_avr_agg
+                ], dim=-1))
+
+            elif self.lead_group_strategy == 'limb_chest':
+                # 肢体/胸导联分组模式
+                wave_limb = wave_stacked[:, self.LIMB_LEADS, :, :]
+                wave_chest = wave_stacked[:, self.CHEST_LEADS, :, :]
+                beat_limb = beat_stacked[:, self.LIMB_LEADS, :, :]
+                beat_chest = beat_stacked[:, self.CHEST_LEADS, :, :]
+                rhythm_limb = rhythm_stacked[:, self.LIMB_LEADS, :, :]
+                rhythm_chest = rhythm_stacked[:, self.CHEST_LEADS, :, :]
+
+                # Wave层级
+                wave_limb = self.wave_limb_transformer(wave_limb)
+                wave_chest = self.wave_chest_transformer(wave_chest)
+                wave_limb_agg, _ = self.wave_limb_agg(wave_limb)
+                wave_chest_agg, _ = self.wave_chest_agg(wave_chest)
+                wave_agg = self.wave_group_fusion(torch.cat([wave_limb_agg, wave_chest_agg], dim=-1))
+
+                # Beat层级
+                beat_limb = self.beat_limb_transformer(beat_limb)
+                beat_chest = self.beat_chest_transformer(beat_chest)
+                beat_limb_agg, _ = self.beat_limb_agg(beat_limb)
+                beat_chest_agg, _ = self.beat_chest_agg(beat_chest)
+                beat_agg = self.beat_group_fusion(torch.cat([beat_limb_agg, beat_chest_agg], dim=-1))
+
+                # Rhythm层级
+                rhythm_limb = self.rhythm_limb_transformer(rhythm_limb)
+                rhythm_chest = self.rhythm_chest_transformer(rhythm_chest)
+                rhythm_limb_agg, _ = self.rhythm_limb_agg(rhythm_limb)
+                rhythm_chest_agg, _ = self.rhythm_chest_agg(rhythm_chest)
+                rhythm_agg = self.rhythm_group_fusion(torch.cat([rhythm_limb_agg, rhythm_chest_agg], dim=-1))
+
+            else:
+                # 无分组模式
+                wave_stacked = self.wave_transformer(wave_stacked)
+                beat_stacked = self.beat_transformer(beat_stacked)
+                rhythm_stacked = self.rhythm_transformer(rhythm_stacked)
+
+                wave_agg, _ = self.wave_cross_lead(wave_stacked)
+                beat_agg, _ = self.beat_cross_lead(beat_stacked)
+                rhythm_agg, _ = self.rhythm_cross_lead(rhythm_stacked)
+
+            # 返回序列特征和池化特征
+            wave_pooled = wave_agg.mean(dim=1)
+            beat_pooled = beat_agg.mean(dim=1)
+            rhythm_pooled = rhythm_agg.mean(dim=1)
+
+            return {
+                'wave_seq': wave_agg,      # (B, n_wave, D) 序列特征
+                'beat_seq': beat_agg,      # (B, n_beat, D) 序列特征
+                'rhythm_seq': rhythm_agg,  # (B, n_rhythm, D) 序列特征
+                'wave': wave_pooled,       # (B, D) 池化特征
+                'beat': beat_pooled,       # (B, D) 池化特征
+                'rhythm': rhythm_pooled    # (B, D) 池化特征
+            }
+        else:
+            raise NotImplementedError("forward_for_generation only supports 'separate' fusion mode")
+
     def forward_multiscale(self, x: torch.Tensor) -> Dict[str, torch.Tensor]:
         """
         返回三个尺度的池化特征，用于MultiScaleClipLoss。

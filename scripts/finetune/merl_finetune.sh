@@ -5,7 +5,7 @@
 
 # ============ 配置区域 ============
 # 在这里设置预训练模型的checkpoint路径
-CKPT_PATH="~/autodl-tmp/logs/melp/ckpts/melp_merl_2025_12_22_23_32_45/epoch=6-step=5096.ckpt"
+CKPT_PATH="~/autodl-tmp/logs/melp/ckpts/melp_merl_2026_01_09_15_09_26/epoch=5-step=17472.ckpt"
 # ==================================
 
 echo "开始批量微调实验..."
@@ -14,24 +14,47 @@ echo "总实验数: 21 (7个数据集 × 3个训练比例)"
 echo "开始时间: $(date)"
 echo "=================================="
 
-# anzhen 数据集实验
-echo "数据集: anzhen, 训练比例: 0.01"
+
+# icbeb 数据集实验
+echo "数据集: icbeb, 训练比例: 0.01"
 CUDA_VISIBLE_DEVICES=0,1,2,3 python main_finetune.py \
-    --model_name merl --dataset_name anzhen \
+    --model_name merl --dataset_name icbeb \
     --train_data_pct 0.01 \
     --ckpt_path $CKPT_PATH \
     --num_devices 4
 
-echo "数据集: anzhen, 训练比例: 0.1"
+echo "数据集: icbeb, 训练比例: 0.1"
 CUDA_VISIBLE_DEVICES=0,1,2,3 python main_finetune.py \
-    --model_name merl --dataset_name anzhen \
+    --model_name merl --dataset_name icbeb \
     --train_data_pct 0.1 \
     --ckpt_path $CKPT_PATH \
     --num_devices 4
 
-echo "数据集: anzhen, 训练比例: 1.0"
+echo "数据集: icbeb, 训练比例: 1.0"
 CUDA_VISIBLE_DEVICES=0,1,2,3 python main_finetune.py \
-    --model_name merl --dataset_name anzhen \
+    --model_name merl --dataset_name icbeb \
+    --train_data_pct 1.0 \
+    --ckpt_path $CKPT_PATH \
+    --num_devices 4
+
+# chapman 数据集实验
+echo "数据集: chapman, 训练比例: 0.01"
+CUDA_VISIBLE_DEVICES=0,1,2,3 python main_finetune.py \
+    --model_name merl --dataset_name chapman \
+    --train_data_pct 0.01 \
+    --ckpt_path $CKPT_PATH \
+    --num_devices 4
+
+echo "数据集: chapman, 训练比例: 0.1"
+CUDA_VISIBLE_DEVICES=0,1,2,3 python main_finetune.py \
+    --model_name merl --dataset_name chapman \
+    --train_data_pct 0.1 \
+    --ckpt_path $CKPT_PATH \
+    --num_devices 4
+
+echo "数据集: chapman, 训练比例: 1.0"
+CUDA_VISIBLE_DEVICES=0,1,2,3 python main_finetune.py \
+    --model_name merl --dataset_name chapman \
     --train_data_pct 1.0 \
     --ckpt_path $CKPT_PATH \
     --num_devices 4
@@ -124,46 +147,24 @@ CUDA_VISIBLE_DEVICES=0,1,2,3 python main_finetune.py \
     --ckpt_path $CKPT_PATH \
     --num_devices 4
 
-# icbeb 数据集实验
-echo "数据集: icbeb, 训练比例: 0.01"
+# anzhen 数据集实验
+echo "数据集: anzhen, 训练比例: 0.01"
 CUDA_VISIBLE_DEVICES=0,1,2,3 python main_finetune.py \
-    --model_name merl --dataset_name icbeb \
+    --model_name merl --dataset_name anzhen \
     --train_data_pct 0.01 \
     --ckpt_path $CKPT_PATH \
     --num_devices 4
 
-echo "数据集: icbeb, 训练比例: 0.1"
+echo "数据集: anzhen, 训练比例: 0.1"
 CUDA_VISIBLE_DEVICES=0,1,2,3 python main_finetune.py \
-    --model_name merl --dataset_name icbeb \
+    --model_name merl --dataset_name anzhen \
     --train_data_pct 0.1 \
     --ckpt_path $CKPT_PATH \
     --num_devices 4
 
-echo "数据集: icbeb, 训练比例: 1.0"
+echo "数据集: anzhen, 训练比例: 1.0"
 CUDA_VISIBLE_DEVICES=0,1,2,3 python main_finetune.py \
-    --model_name merl --dataset_name icbeb \
-    --train_data_pct 1.0 \
-    --ckpt_path $CKPT_PATH \
-    --num_devices 4
-
-# chapman 数据集实验
-echo "数据集: chapman, 训练比例: 0.01"
-CUDA_VISIBLE_DEVICES=0,1,2,3 python main_finetune.py \
-    --model_name merl --dataset_name chapman \
-    --train_data_pct 0.01 \
-    --ckpt_path $CKPT_PATH \
-    --num_devices 4
-
-echo "数据集: chapman, 训练比例: 0.1"
-CUDA_VISIBLE_DEVICES=0,1,2,3 python main_finetune.py \
-    --model_name merl --dataset_name chapman \
-    --train_data_pct 0.1 \
-    --ckpt_path $CKPT_PATH \
-    --num_devices 4
-
-echo "数据集: chapman, 训练比例: 1.0"
-CUDA_VISIBLE_DEVICES=0,1,2,3 python main_finetune.py \
-    --model_name merl --dataset_name chapman \
+    --model_name merl --dataset_name anzhen \
     --train_data_pct 1.0 \
     --ckpt_path $CKPT_PATH \
     --num_devices 4

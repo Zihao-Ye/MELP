@@ -6,9 +6,11 @@ import json
 import os
 import warnings
 import yaml
-import torch 
+import torch
 import random
 import argparse
+import datetime
+from dateutil import tz
 import numpy as np
 import pandas as pd
 from tqdm import tqdm
@@ -33,13 +35,16 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
 def load_model(model_name: str, ckpt_path: str):
+    # 展开 ~ 路径
+    ckpt_path = os.path.expanduser(ckpt_path)
+
     if model_name == "merl":
         if ckpt_path == "":
             model = MERLModel()
         else:
             # model = MERLModel.load_from_checkpoint(ckpt_path)
             model = MERLModel()
-            model.load_state_dict(torch.load(ckpt_path))
+            model.load_state_dict(torch.load(ckpt_path, weights_only=False)['state_dict'])
     elif model_name == "melp":
         if ckpt_path == "":
             model = MELPModel()
@@ -99,10 +104,9 @@ def get_ecg_emd(model, loader, zeroshot_weights, device='cuda', softmax_eval=Tru
     with torch.no_grad():
         for i, batch in enumerate(tqdm(loader, total=len(loader), desc='Computing ECG embeddings')):
             ecg = batch['ecg']
-            ecg = ecg.to(device=device) 
+            ecg = ecg.to(device=device)
             # predict
-            # ecg_emb = model.ext_ecg_emb(ecg)
-            ecg_emb = model.encode_ecg(ecg, normalize=True, proj_contrast=True)
+            ecg_emb = model.ext_ecg_emb(ecg)
             ecg_emb /= ecg_emb.norm(dim=-1, keepdim=True)
 
             # obtain logits (cos similarity)
@@ -211,7 +215,7 @@ def zeroshot_eval(model, test_loader, results_dir, compute_ci=False, save_result
     '''
     Zero-shot evaluation of the model on the given dataset.
     '''
-    
+
     with open(PROMPT_PATH, 'r') as f:
        prompt_dict = yaml.load(f, Loader=yaml.FullLoader)
 
@@ -226,7 +230,7 @@ def zeroshot_eval(model, test_loader, results_dir, compute_ci=False, save_result
     # (embed_dim, num_classes)
     zeroshot_weights = get_class_emd(model, target_class, device=device)
     # get ecg prediction
-    pred = get_ecg_emd(model, test_loader, 
+    pred = get_ecg_emd(model, test_loader,
                        zeroshot_weights, device=device, softmax_eval=True)
 
     res_dict = compute_metrics(gt, pred, class_name)
@@ -241,7 +245,7 @@ def zeroshot_eval(model, test_loader, results_dir, compute_ci=False, save_result
     print(ori_summary_df)
     if save_results:
         ori_df.to_csv(os.path.join(results_dir, 'ori.csv'))
-    
+
     if compute_ci:
         # bootstrap confidence interval
         boot_df, boot_ci_df = bootstrap_ci(gt, pred, class_name)
@@ -256,14 +260,66 @@ def zeroshot_eval(model, test_loader, results_dir, compute_ci=False, save_result
         print("Metrics per class: ")
         print(boot_ci_df)
 
+    # 返回汇总结果
+    return {
+        'AUROC': float(ori_summary_dict['AUROC'][0]),
+        'F1': float(ori_summary_dict['F1'][0]),
+        'ACC': float(ori_summary_dict['ACC'][0])
+    }
+
 
 def main(args):
     model = load_model(model_name=args.model_name, ckpt_path=args.ckpt_path)
+
+    # 生成带时间戳的实验目录名
+    now = datetime.datetime.now(tz.tzlocal())
+    extension = now.strftime("%Y_%m_%d_%H_%M_%S")
+    exp_name = f"zeroshot_{args.model_name}_{extension}"
+    exp_dir = RESULTS_PATH / exp_name
+    os.makedirs(exp_dir, exist_ok=True)
+    print(f"\nExperiment directory: {exp_dir}")
+
+    # 汇总结果
+    all_results = []
+
     for dataset_name in args.test_sets:
+        print("\n" + "=" * 60)
+        print(f"Evaluating on: {dataset_name}")
+        print("=" * 60)
+
         dataloader = get_dataloader(dataset_name=dataset_name, batch_size=args.batch_size, num_workers=args.num_workers)
-        results_dir = str(RESULTS_PATH / f"zeroshot_{args.model_name}_{dataset_name}")
+
+        # 结果目录（每个数据集一个子目录）
+        results_dir = str(exp_dir / dataset_name)
         os.makedirs(results_dir, exist_ok=True)
-        zeroshot_eval(model, dataloader, results_dir, compute_ci=args.compute_ci, save_results=args.save_results)
+
+        summary = zeroshot_eval(model, dataloader, results_dir, compute_ci=args.compute_ci, save_results=args.save_results)
+        summary['dataset'] = dataset_name
+        all_results.append(summary)
+
+    # 打印汇总
+    print("\n" + "=" * 60)
+    print("Summary Across All Datasets")
+    print("=" * 60)
+
+    summary_df = pd.DataFrame(all_results)
+    print(summary_df.to_string(index=False))
+
+    # 计算平均
+    print(f"\nOverall Mean AUROC: {summary_df['AUROC'].mean():.2f}")
+    print(f"Overall Mean F1:    {summary_df['F1'].mean():.2f}")
+    print(f"Overall Mean ACC:   {summary_df['ACC'].mean():.2f}")
+
+    # 保存汇总结果
+    if args.save_results:
+        summary_path = str(exp_dir / "summary.csv")
+        summary_df.to_csv(summary_path, index=False)
+        print(f"\nSummary saved to: {summary_path}")
+
+    print("\n" + "=" * 60)
+    print("All evaluations completed!")
+    print(f"Results saved to: {exp_dir}")
+    print("=" * 60)
 
 
 if __name__ == '__main__':
