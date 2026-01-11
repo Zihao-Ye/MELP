@@ -280,9 +280,15 @@ class MVCSEMSSATEModel(BasePretrainModel):
             )
 
     def init_text_encoder(self):
-        """初始化文本编码器（完全冻结，作为特征提取器）"""
+        """初始化文本编码器（与MERL保持一致）"""
         if self.text_encoder_name == "ncbi/MedCPT-Query-Encoder":
             self.lm_model = AutoModel.from_pretrained(self.text_encoder_name)
+
+            # 冻结前几层
+            for layer_idx in range(self.num_freeze_layers):
+                for param in list(self.lm_model.encoder.layer[layer_idx].parameters()):
+                    param.requires_grad = False
+
             text_encoder_hidden_dim = 768
 
         elif self.text_encoder_name == "google/flan-t5-small":
@@ -297,10 +303,6 @@ class MVCSEMSSATEModel(BasePretrainModel):
 
         else:
             raise NotImplementedError(f"Unknown text encoder: {self.text_encoder_name}")
-
-        # 完全冻结文本编码器
-        for param in self.lm_model.parameters():
-            param.requires_grad = False
 
         self.text_encoder_hidden_dim = text_encoder_hidden_dim
 
