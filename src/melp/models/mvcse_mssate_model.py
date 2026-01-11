@@ -773,10 +773,30 @@ class MVCSEMSSATEModel(BasePretrainModel):
 
             logit_scale = self.logit_scale.exp()
 
-            # Wave/Beat/Rhythm: 全部使用硬标签 ClipLoss
+            # Wave/Beat: 使用硬标签 ClipLoss
             loss_wave = self.clip_loss(wave_z, text_wave_z, logit_scale)
             loss_beat = self.clip_loss(beat_z, text_beat_z, logit_scale)
-            loss_rhythm = self.clip_loss(rhythm_z, text_rhythm_z, logit_scale)
+
+            # Rhythm: 使用软标签 (基于文本语义相似度)
+            if self.use_learnable_sim:
+                # 更新分布式参数
+                self.rhythm_soft_clip_loss.rank = rank
+                self.rhythm_soft_clip_loss.world_size = world_size
+
+                # 计算文本语义相似度矩阵 (使用原始text_emb)
+                with torch.no_grad():
+                    text_emb_norm = F.normalize(text_emb, dim=-1)
+                    text_sim_matrix = text_emb_norm @ text_emb_norm.T
+
+                # 使用可学习软标签loss
+                loss_rhythm = self.rhythm_soft_clip_loss(
+                    rhythm_z, text_rhythm_z, logit_scale,
+                    sim_matrix=text_sim_matrix,
+                    threshold=self.learnable_threshold,
+                    soft_weight=self.learnable_soft_weight
+                )
+            else:
+                loss_rhythm = self.clip_loss(rhythm_z, text_rhythm_z, logit_scale)
 
             # 对比学习主损失
             loss_clip = loss_wave + loss_beat + loss_rhythm
@@ -789,6 +809,11 @@ class MVCSEMSSATEModel(BasePretrainModel):
                 'loss_rhythm': loss_rhythm,
                 'logit_scale': logit_scale,
             }
+
+            # 记录软标签参数
+            if self.use_learnable_sim:
+                loss_dict['rhythm_threshold'] = torch.sigmoid(self.learnable_threshold).detach()
+                loss_dict['rhythm_soft_weight'] = torch.sigmoid(self.learnable_soft_weight).detach()
 
             # ========== 诊断生成损失（如果启用）==========
             if self.use_diagnosis_generator:
