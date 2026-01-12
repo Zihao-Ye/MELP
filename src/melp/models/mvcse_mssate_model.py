@@ -786,7 +786,15 @@ class MVCSEMSSATEModel(BasePretrainModel):
                 # 计算文本语义相似度矩阵 (使用原始text_emb)
                 with torch.no_grad():
                     text_emb_norm = F.normalize(text_emb, dim=-1)
-                    text_sim_matrix = text_emb_norm @ text_emb_norm.T
+                    # 分布式环境下需要gather所有text_emb
+                    if world_size > 1:
+                        gathered_text_emb = [torch.zeros_like(text_emb_norm) for _ in range(world_size)]
+                        torch.distributed.all_gather(gathered_text_emb, text_emb_norm.contiguous())
+                        all_text_emb_norm = torch.cat(gathered_text_emb, dim=0)
+                        # 本地text与全局text的相似度: (local_batch, global_batch)
+                        text_sim_matrix = text_emb_norm @ all_text_emb_norm.T
+                    else:
+                        text_sim_matrix = text_emb_norm @ text_emb_norm.T
 
                 # 使用可学习软标签loss
                 loss_rhythm = self.rhythm_soft_clip_loss(
