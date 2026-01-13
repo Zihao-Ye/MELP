@@ -14,7 +14,7 @@ from typing import Optional, List, Dict, Any
 
 from .mvcse import MVCSEEncoder
 from .mssate import MSSATEEncoder
-from .resnet_frontend import resnet18_frontend
+from .resnet_frontend import resnet18_frontend, resnet34_frontend
 from .attention import HierarchicalECGPooler, AttentionalPooler
 from .transformer import LeadTransformer
 from einops import rearrange
@@ -386,6 +386,10 @@ class HierarchicalMVCSEMSSATEEncoder(nn.Module):
         embed_dim: int = 256,
         seq_len: int = 5000,
         num_leads: int = 12,
+        # 多尺度Pooler开关
+        use_multiscale_pooler: bool = True,  # False则不使用多尺度Pooler（消融实验）
+        # ResNet前端选择
+        resnet_type: str = 'resnet18',  # 'resnet18', 'resnet34'
         # HierarchicalPooler参数
         n_wave_queries: int = 30,
         n_beat_queries: int = 10,
@@ -413,38 +417,53 @@ class HierarchicalMVCSEMSSATEEncoder(nn.Module):
         self.embed_dim = embed_dim
         self.num_leads = num_leads
         self.pooler_fusion = pooler_fusion
+        self.use_multiscale_pooler = use_multiscale_pooler
+        self.resnet_type = resnet_type
 
         # 处理分组策略（兼容旧参数）
         if use_lead_groups and lead_group_strategy == 'none':
             lead_group_strategy = 'limb_chest'
         self.lead_group_strategy = lead_group_strategy
 
-        # ResNet18前端 (全局共享)
-        self.resnet = resnet18_frontend(in_channels=1)
-        resnet_out_dim = self.resnet.out_channels  # 512
+        # ResNet前端 (全局共享)
+        if resnet_type == 'resnet18':
+            self.resnet = resnet18_frontend(in_channels=1)
+        elif resnet_type == 'resnet34':
+            self.resnet = resnet34_frontend(in_channels=1)
+        else:
+            raise ValueError(f"Unknown resnet_type: {resnet_type}. Supported: 'resnet18', 'resnet34'")
+        resnet_out_dim = self.resnet.out_channels  # 512 for both resnet18 and resnet34
 
-        # 层级Pooler (全局共享，所有导联用同一个)
-        self.hierarchical_pooler = HierarchicalECGPooler(
-            embed_dim=embed_dim,
-            context_dim=resnet_out_dim,
-            n_head=pooler_heads,
-            n_wave_queries=n_wave_queries,
-            n_beat_queries=n_beat_queries,
-            n_rhythm_queries=n_rhythm_queries,
-            dropout=pooler_dropout,
-            fusion_type=pooler_fusion
-        )
+        if use_multiscale_pooler:
+            # 层级Pooler (全局共享，所有导联用同一个)
+            self.hierarchical_pooler = HierarchicalECGPooler(
+                embed_dim=embed_dim,
+                context_dim=resnet_out_dim,
+                n_head=pooler_heads,
+                n_wave_queries=n_wave_queries,
+                n_beat_queries=n_beat_queries,
+                n_rhythm_queries=n_rhythm_queries,
+                dropout=pooler_dropout,
+                fusion_type=pooler_fusion
+            )
 
-        # 记录query数量
-        self.n_wave_queries = n_wave_queries
-        self.n_beat_queries = n_beat_queries
-        self.n_rhythm_queries = n_rhythm_queries
+            # 记录query数量
+            self.n_wave_queries = n_wave_queries
+            self.n_beat_queries = n_beat_queries
+            self.n_rhythm_queries = n_rhythm_queries
+        else:
+            # 单尺度模式：不使用多尺度Pooler，直接用ResNet输出
+            # 投影层：将ResNet输出(512)投影到embed_dim(256)
+            self.resnet_proj = nn.Sequential(
+                nn.Linear(resnet_out_dim, embed_dim),
+                nn.LayerNorm(embed_dim)
+            )
 
         # 跨导联聚合模块
         from .attention import CrossLeadAggregation
 
         # LeadTransformer 和 CrossLeadAggregation
-        if pooler_fusion == 'separate':
+        if use_multiscale_pooler and pooler_fusion == 'separate':
             if lead_group_strategy == 'lisa':
                 # ========== LISA分组: 每层级×5组 = 15个Transformer + 15个Aggregation ==========
                 # Wave层级 - 5组: lateral, inferior, septal, anterior, avr
@@ -649,6 +668,76 @@ class HierarchicalMVCSEMSSATEEncoder(nn.Module):
                 self.wave_cross_lead = CrossLeadAggregation(embed_dim=embed_dim, depth=1)
                 self.beat_cross_lead = CrossLeadAggregation(embed_dim=embed_dim, depth=1)
                 self.rhythm_cross_lead = CrossLeadAggregation(embed_dim=embed_dim, depth=1)
+        elif not use_multiscale_pooler:
+            # ========== 单尺度模式（消融实验）==========
+            if lead_group_strategy == 'lisa':
+                # LISA分组: 1尺度×5组 = 5个Transformer + 5个Aggregation
+                self.single_lateral_transformer = LeadTransformer(
+                    embed_dim=embed_dim, depth=lead_transformer_depth,
+                    num_heads=lead_transformer_heads, dim_head=lead_transformer_dim_head,
+                    mlp_ratio=lead_transformer_mlp_ratio, dropout=lead_transformer_dropout,
+                    drop_path=lead_transformer_drop_path, max_len=max_len, use_relative_pos=True
+                )
+                self.single_inferior_transformer = LeadTransformer(
+                    embed_dim=embed_dim, depth=lead_transformer_depth,
+                    num_heads=lead_transformer_heads, dim_head=lead_transformer_dim_head,
+                    mlp_ratio=lead_transformer_mlp_ratio, dropout=lead_transformer_dropout,
+                    drop_path=lead_transformer_drop_path, max_len=max_len, use_relative_pos=True
+                )
+                self.single_septal_transformer = LeadTransformer(
+                    embed_dim=embed_dim, depth=lead_transformer_depth,
+                    num_heads=lead_transformer_heads, dim_head=lead_transformer_dim_head,
+                    mlp_ratio=lead_transformer_mlp_ratio, dropout=lead_transformer_dropout,
+                    drop_path=lead_transformer_drop_path, max_len=max_len, use_relative_pos=True
+                )
+                self.single_anterior_transformer = LeadTransformer(
+                    embed_dim=embed_dim, depth=lead_transformer_depth,
+                    num_heads=lead_transformer_heads, dim_head=lead_transformer_dim_head,
+                    mlp_ratio=lead_transformer_mlp_ratio, dropout=lead_transformer_dropout,
+                    drop_path=lead_transformer_drop_path, max_len=max_len, use_relative_pos=True
+                )
+                self.single_avr_transformer = LeadTransformer(
+                    embed_dim=embed_dim, depth=lead_transformer_depth,
+                    num_heads=lead_transformer_heads, dim_head=lead_transformer_dim_head,
+                    mlp_ratio=lead_transformer_mlp_ratio, dropout=lead_transformer_dropout,
+                    drop_path=lead_transformer_drop_path, max_len=max_len, use_relative_pos=True
+                )
+                self.single_lateral_agg = CrossLeadAggregation(embed_dim=embed_dim, depth=1)
+                self.single_inferior_agg = CrossLeadAggregation(embed_dim=embed_dim, depth=1)
+                self.single_septal_agg = CrossLeadAggregation(embed_dim=embed_dim, depth=1)
+                self.single_anterior_agg = CrossLeadAggregation(embed_dim=embed_dim, depth=1)
+                self.single_avr_agg = CrossLeadAggregation(embed_dim=embed_dim, depth=1)
+                self.single_group_fusion = nn.Sequential(
+                    nn.Linear(embed_dim * 5, embed_dim), nn.LayerNorm(embed_dim), nn.GELU()
+                )
+            elif lead_group_strategy == 'limb_chest':
+                # 肢体/胸导联分组: 1尺度×2组 = 2个Transformer + 2个Aggregation
+                self.single_limb_transformer = LeadTransformer(
+                    embed_dim=embed_dim, depth=lead_transformer_depth,
+                    num_heads=lead_transformer_heads, dim_head=lead_transformer_dim_head,
+                    mlp_ratio=lead_transformer_mlp_ratio, dropout=lead_transformer_dropout,
+                    drop_path=lead_transformer_drop_path, max_len=max_len, use_relative_pos=True
+                )
+                self.single_chest_transformer = LeadTransformer(
+                    embed_dim=embed_dim, depth=lead_transformer_depth,
+                    num_heads=lead_transformer_heads, dim_head=lead_transformer_dim_head,
+                    mlp_ratio=lead_transformer_mlp_ratio, dropout=lead_transformer_dropout,
+                    drop_path=lead_transformer_drop_path, max_len=max_len, use_relative_pos=True
+                )
+                self.single_limb_agg = CrossLeadAggregation(embed_dim=embed_dim, depth=1)
+                self.single_chest_agg = CrossLeadAggregation(embed_dim=embed_dim, depth=1)
+                self.single_group_fusion = nn.Sequential(
+                    nn.Linear(embed_dim * 2, embed_dim), nn.LayerNorm(embed_dim), nn.GELU()
+                )
+            else:
+                # 无分组: 1个Transformer + 1个Aggregation
+                self.single_transformer = LeadTransformer(
+                    embed_dim=embed_dim, depth=lead_transformer_depth,
+                    num_heads=lead_transformer_heads, dim_head=lead_transformer_dim_head,
+                    mlp_ratio=lead_transformer_mlp_ratio, dropout=lead_transformer_dropout,
+                    drop_path=lead_transformer_drop_path, max_len=max_len, use_relative_pos=True
+                )
+                self.single_cross_lead = CrossLeadAggregation(embed_dim=embed_dim, depth=1)
         else:
             # 统一的Transformer处理融合后的特征 (暂不支持分组)
             self.unified_transformer = LeadTransformer(
@@ -661,7 +750,7 @@ class HierarchicalMVCSEMSSATEEncoder(nn.Module):
 
         # 最终输出
         self.pool_type = pool_type
-        if pooler_fusion == 'separate':
+        if use_multiscale_pooler and pooler_fusion == 'separate':
             fusion_dim = embed_dim * 3 if pool_type == 'concat' else embed_dim
         else:
             fusion_dim = embed_dim
@@ -685,6 +774,75 @@ class HierarchicalMVCSEMSSATEEncoder(nn.Module):
         """
         B = x.shape[0]
 
+        # ========== 单尺度模式（消融实验）==========
+        if not self.use_multiscale_pooler:
+            # 收集所有导联的特征
+            all_lead_feats = []
+            for lead_idx in range(self.num_leads):
+                lead_signal = x[:, lead_idx:lead_idx+1, :]  # (B, 1, L)
+                lead_feat = self.resnet(lead_signal)  # (B, 512, T)
+                lead_feat = rearrange(lead_feat, 'b c n -> b n c')  # (B, T, 512)
+                lead_feat = self.resnet_proj(lead_feat)  # (B, T, embed_dim)
+                all_lead_feats.append(lead_feat)
+
+            # 堆叠12导联: (B, 12, T, D)
+            lead_stacked = torch.stack(all_lead_feats, dim=1)  # (B, 12, T, D)
+
+            if self.lead_group_strategy == 'lisa':
+                # LISA分组
+                lateral = lead_stacked[:, self.LATERAL_LEADS, :, :]
+                inferior = lead_stacked[:, self.INFERIOR_LEADS, :, :]
+                septal = lead_stacked[:, self.SEPTAL_LEADS, :, :]
+                anterior = lead_stacked[:, self.ANTERIOR_LEADS, :, :]
+                avr = lead_stacked[:, self.AVR_LEADS, :, :]
+
+                lateral = self.single_lateral_transformer(lateral)
+                inferior = self.single_inferior_transformer(inferior)
+                septal = self.single_septal_transformer(septal)
+                anterior = self.single_anterior_transformer(anterior)
+                avr = self.single_avr_transformer(avr)
+
+                lateral_agg, _ = self.single_lateral_agg(lateral)
+                inferior_agg, _ = self.single_inferior_agg(inferior)
+                septal_agg, _ = self.single_septal_agg(septal)
+                anterior_agg, _ = self.single_anterior_agg(anterior)
+                avr_agg, _ = self.single_avr_agg(avr)
+
+                # 融合5组
+                fused = self.single_group_fusion(torch.cat([
+                    lateral_agg.mean(dim=1), inferior_agg.mean(dim=1),
+                    septal_agg.mean(dim=1), anterior_agg.mean(dim=1),
+                    avr_agg.mean(dim=1)
+                ], dim=-1))
+                output = self.output_proj(fused)
+
+            elif self.lead_group_strategy == 'limb_chest':
+                # 肢体/胸导联分组
+                limb = lead_stacked[:, self.LIMB_LEADS, :, :]
+                chest = lead_stacked[:, self.CHEST_LEADS, :, :]
+
+                limb = self.single_limb_transformer(limb)
+                chest = self.single_chest_transformer(chest)
+
+                limb_agg, _ = self.single_limb_agg(limb)
+                chest_agg, _ = self.single_chest_agg(chest)
+
+                # 融合2组
+                fused = self.single_group_fusion(torch.cat([
+                    limb_agg.mean(dim=1), chest_agg.mean(dim=1)
+                ], dim=-1))
+                output = self.output_proj(fused)
+
+            else:
+                # 无分组
+                lead_stacked = self.single_transformer(lead_stacked)
+                lead_agg, _ = self.single_cross_lead(lead_stacked)
+                output = lead_agg.mean(dim=1)
+                output = self.output_proj(output)
+
+            return output
+
+        # ========== 多尺度模式 ==========
         # 收集所有导联的层级特征
         all_wave_feats = []
         all_beat_feats = []
@@ -1110,18 +1268,86 @@ class HierarchicalMVCSEMSSATEEncoder(nn.Module):
     def forward_multiscale(self, x: torch.Tensor) -> Dict[str, torch.Tensor]:
         """
         返回三个尺度的池化特征，用于MultiScaleClipLoss。
+        如果use_multiscale_pooler=False，则返回单尺度特征。
 
         Args:
             x: (B, 12, L) - 12导联ECG信号
 
         Returns:
-            Dict containing:
+            多尺度模式:
             - 'wave': (B, D) 波段级池化特征
             - 'beat': (B, D) 心拍级池化特征
             - 'rhythm': (B, D) 节律级池化特征
+
+            单尺度模式:
+            - 'single': (B, D) 单一池化特征
         """
         B = x.shape[0]
 
+        if not self.use_multiscale_pooler:
+            # ========== 单尺度模式（消融实验）==========
+            all_lead_feats = []
+            for lead_idx in range(self.num_leads):
+                lead_signal = x[:, lead_idx:lead_idx+1, :]
+                lead_feat = self.resnet(lead_signal)  # (B, 512, 313)
+                lead_feat = rearrange(lead_feat, 'b c n -> b n c')  # (B, 313, 512)
+                lead_feat = self.resnet_proj(lead_feat)  # (B, 313, 256)
+                all_lead_feats.append(lead_feat)
+
+            # 堆叠12导联: (B, 12, 313, 256)
+            single_stacked = torch.stack(all_lead_feats, dim=1)
+
+            if self.lead_group_strategy == 'lisa':
+                # LISA分组
+                single_lateral = single_stacked[:, self.LATERAL_LEADS, :, :]
+                single_inferior = single_stacked[:, self.INFERIOR_LEADS, :, :]
+                single_septal = single_stacked[:, self.SEPTAL_LEADS, :, :]
+                single_anterior = single_stacked[:, self.ANTERIOR_LEADS, :, :]
+                single_avr = single_stacked[:, self.AVR_LEADS, :, :]
+
+                single_lateral = self.single_lateral_transformer(single_lateral)
+                single_inferior = self.single_inferior_transformer(single_inferior)
+                single_septal = self.single_septal_transformer(single_septal)
+                single_anterior = self.single_anterior_transformer(single_anterior)
+                single_avr = self.single_avr_transformer(single_avr)
+
+                single_lateral_agg, _ = self.single_lateral_agg(single_lateral)
+                single_inferior_agg, _ = self.single_inferior_agg(single_inferior)
+                single_septal_agg, _ = self.single_septal_agg(single_septal)
+                single_anterior_agg, _ = self.single_anterior_agg(single_anterior)
+                single_avr_agg, _ = self.single_avr_agg(single_avr)
+
+                single_agg = self.single_group_fusion(torch.cat([
+                    single_lateral_agg, single_inferior_agg, single_septal_agg,
+                    single_anterior_agg, single_avr_agg
+                ], dim=-1))
+
+            elif self.lead_group_strategy == 'limb_chest':
+                # 肢体/胸导联分组
+                single_limb = single_stacked[:, self.LIMB_LEADS, :, :]
+                single_chest = single_stacked[:, self.CHEST_LEADS, :, :]
+
+                single_limb = self.single_limb_transformer(single_limb)
+                single_chest = self.single_chest_transformer(single_chest)
+
+                single_limb_agg, _ = self.single_limb_agg(single_limb)
+                single_chest_agg, _ = self.single_chest_agg(single_chest)
+
+                single_agg = self.single_group_fusion(torch.cat([
+                    single_limb_agg, single_chest_agg
+                ], dim=-1))
+
+            else:
+                # 无分组
+                single_stacked = self.single_transformer(single_stacked)
+                single_agg, _ = self.single_cross_lead(single_stacked)
+
+            # 池化: (B, N, D) -> (B, D)
+            single_pooled = single_agg.mean(dim=1)
+
+            return {'single': single_pooled}
+
+        # ========== 多尺度模式 ==========
         all_wave_feats = []
         all_beat_feats = []
         all_rhythm_feats = []
@@ -1273,12 +1499,19 @@ class HierarchicalMVCSEMSSATEEncoder(nn.Module):
         }
 
     def extra_repr(self) -> str:
-        return (
-            f'embed_dim={self.embed_dim}, num_leads={self.num_leads}, '
-            f'queries=(wave={self.n_wave_queries}, beat={self.n_beat_queries}, '
-            f'rhythm={self.n_rhythm_queries}), fusion={self.pooler_fusion}, '
-            f'lead_group_strategy={self.lead_group_strategy}'
-        )
+        if self.use_multiscale_pooler:
+            return (
+                f'embed_dim={self.embed_dim}, num_leads={self.num_leads}, '
+                f'queries=(wave={self.n_wave_queries}, beat={self.n_beat_queries}, '
+                f'rhythm={self.n_rhythm_queries}), fusion={self.pooler_fusion}, '
+                f'lead_group_strategy={self.lead_group_strategy}'
+            )
+        else:
+            return (
+                f'embed_dim={self.embed_dim}, num_leads={self.num_leads}, '
+                f'use_multiscale_pooler=False (ablation), '
+                f'lead_group_strategy={self.lead_group_strategy}'
+            )
 
 
 # ============================================================================
@@ -1393,7 +1626,7 @@ def mvcse_mssate_large(seq_len: int = 5000, output_dim: int = 256, **kwargs):
 # Hierarchical版本配置 (使用可学习Query)
 # ============================================================================
 
-def hierarchical_mvcse_mssate_base(seq_len: int = 5000, output_dim: int = 256, **kwargs):
+def hierarchical_mvcse_mssate_base(seq_len: int = 5000, output_dim: int = 256, resnet_type: str = 'resnet18', **kwargs):
     """
     层级版Base：使用可学习Query替代硬切分
 
@@ -1421,11 +1654,12 @@ def hierarchical_mvcse_mssate_base(seq_len: int = 5000, output_dim: int = 256, *
         lead_transformer_dim_head=64,
         lead_transformer_mlp_ratio=4.,
         output_dim=output_dim,
+        resnet_type=resnet_type,
         **kwargs
     )
 
 
-def hierarchical_mvcse_mssate_small(seq_len: int = 5000, output_dim: int = 256, **kwargs):
+def hierarchical_mvcse_mssate_small(seq_len: int = 5000, output_dim: int = 256, resnet_type: str = 'resnet18', **kwargs):
     """
     层级版Small：轻量级配置
 
@@ -1448,11 +1682,12 @@ def hierarchical_mvcse_mssate_small(seq_len: int = 5000, output_dim: int = 256, 
         lead_transformer_dim_head=48,
         lead_transformer_mlp_ratio=3.,
         output_dim=output_dim,
+        resnet_type=resnet_type,
         **kwargs
     )
 
 
-def hierarchical_mvcse_mssate_large(seq_len: int = 5000, output_dim: int = 256, **kwargs):
+def hierarchical_mvcse_mssate_large(seq_len: int = 5000, output_dim: int = 256, resnet_type: str = 'resnet18', **kwargs):
     """
     层级版Large：更大容量
 
@@ -1475,5 +1710,6 @@ def hierarchical_mvcse_mssate_large(seq_len: int = 5000, output_dim: int = 256, 
         lead_transformer_dim_head=64,
         lead_transformer_mlp_ratio=4.,
         output_dim=output_dim,
+        resnet_type=resnet_type,
         **kwargs
     )

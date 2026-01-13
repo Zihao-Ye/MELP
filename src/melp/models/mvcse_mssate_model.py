@@ -61,6 +61,10 @@ class MVCSEMSSATEModel(BasePretrainModel):
         ecg_encoder_name: str = "mvcse_mssate_base",
         embed_dim: int = 256,
         seq_len: int = 5000,
+        # 多尺度Pooler开关（消融实验）
+        use_multiscale_pooler: bool = True,
+        # ResNet前端选择（消融实验）
+        resnet_type: str = 'resnet18',  # 'resnet18', 'resnet34'
         # 新架构参数（方案B）
         lead_transformer_depth: int = 6,  # 导联级Transformer层数
         lead_transformer_heads: int = 4,
@@ -116,6 +120,8 @@ class MVCSEMSSATEModel(BasePretrainModel):
         self.ecg_encoder_name = ecg_encoder_name
         self.embed_dim = embed_dim
         self.seq_len = seq_len
+        self.use_multiscale_pooler = use_multiscale_pooler  # 消融实验参数
+        self.resnet_type = resnet_type  # ResNet前端选择
         # 新架构参数
         self.lead_transformer_depth = lead_transformer_depth
         self.lead_transformer_heads = lead_transformer_heads
@@ -187,35 +193,46 @@ class MVCSEMSSATEModel(BasePretrainModel):
     def init_ecg_encoder(self):
         """初始化MVCSE-MSSATE ECG编码器"""
         # 判断是否使用多尺度层级encoder
-        self.use_multiscale = self.ecg_encoder_name.startswith('hierarchical_')
+        self.use_multiscale = self.ecg_encoder_name.startswith('hierarchical_') and self.use_multiscale_pooler
 
-        if self.use_multiscale:
-            # ========== 多尺度层级Encoder (wave/beat/rhythm) ==========
+        if self.ecg_encoder_name.startswith('hierarchical_'):
+            # ========== 层级Encoder (支持多尺度和单尺度消融) ==========
             if self.ecg_encoder_name == 'hierarchical_mvcse_mssate_small':
                 self.ecg_encoder = hierarchical_mvcse_mssate_small(
                     seq_len=self.seq_len,
                     output_dim=self.embed_dim,
-                    lead_group_strategy=self.lead_group_strategy
+                    lead_group_strategy=self.lead_group_strategy,
+                    use_multiscale_pooler=self.use_multiscale_pooler,
+                    resnet_type=self.resnet_type
                 )
             elif self.ecg_encoder_name == 'hierarchical_mvcse_mssate_base':
                 self.ecg_encoder = hierarchical_mvcse_mssate_base(
                     seq_len=self.seq_len,
                     output_dim=self.embed_dim,
-                    lead_group_strategy=self.lead_group_strategy
+                    lead_group_strategy=self.lead_group_strategy,
+                    use_multiscale_pooler=self.use_multiscale_pooler,
+                    resnet_type=self.resnet_type
                 )
             elif self.ecg_encoder_name == 'hierarchical_mvcse_mssate_large':
                 self.ecg_encoder = hierarchical_mvcse_mssate_large(
                     seq_len=self.seq_len,
                     output_dim=self.embed_dim,
-                    lead_group_strategy=self.lead_group_strategy
+                    lead_group_strategy=self.lead_group_strategy,
+                    use_multiscale_pooler=self.use_multiscale_pooler,
+                    resnet_type=self.resnet_type
                 )
             else:
                 raise ValueError(f"Unknown hierarchical encoder: {self.ecg_encoder_name}")
 
-            # 多尺度encoder的输出维度
-            self.ecg_out_dim = self.ecg_encoder.embed_dim
+            # encoder的输出维度
+            # 多尺度模式下，forward_multiscale返回embed_dim维度的特征
+            # 单尺度消融模式下，forward返回output_dim维度的特征
+            if self.use_multiscale_pooler:
+                self.ecg_out_dim = self.ecg_encoder.embed_dim
+            else:
+                self.ecg_out_dim = self.ecg_encoder.output_dim
 
-            # 不需要单独的proj_e，投影在MultiScaleClipLoss内部做
+            # 不需要单独的proj_e，投影在init_text_encoder中做
 
         else:
             # ========== 原有的单尺度Encoder ==========
@@ -353,8 +370,36 @@ class MVCSEMSSATEModel(BasePretrainModel):
                     rank=0,
                     world_size=1,
                 )
+        elif self.ecg_encoder_name.startswith('hierarchical_') and not self.use_multiscale_pooler:
+            # ========== 单尺度消融模式（hierarchical encoder但不用多尺度pooler）==========
+            # ECG投影头（单尺度）
+            self.single_proj = nn.Sequential(
+                nn.Linear(self.ecg_out_dim, self.proj_out),
+                nn.LayerNorm(self.proj_out)
+            )
+            # Text投影头（单尺度）
+            self.text_single_proj = nn.Sequential(
+                nn.Linear(text_encoder_hidden_dim, self.proj_out),
+                nn.LayerNorm(self.proj_out)
+            )
+            # 使用与多尺度模式相同的软标签Loss（保持一致性）
+            if self.use_learnable_sim:
+                self.single_soft_clip_loss = LearnableSoftClipLoss(
+                    local_loss=True,
+                    gather_with_grad=True,
+                    rank=0,
+                    world_size=1,
+                )
+            else:
+                self.clip_loss = ClipLoss(
+                    local_loss=True,
+                    gather_with_grad=True,
+                    cache_labels=True,
+                    rank=0,
+                    world_size=1,
+                )
         else:
-            # 单尺度模式：原有投影
+            # 原有单尺度模式：原有投影
             self.proj_t = nn.Sequential(
                 nn.Linear(text_encoder_hidden_dim, self.proj_hidden),
                 nn.GELU(),
@@ -417,8 +462,14 @@ class MVCSEMSSATEModel(BasePretrainModel):
                 'beat': ecg_feats['beat'],      # (B, D)
                 'rhythm': ecg_feats['rhythm']   # (B, D)
             }
+        elif self.ecg_encoder_name.startswith('hierarchical_') and not self.use_multiscale_pooler:
+            # 单尺度消融模式（hierarchical encoder但不用多尺度pooler）
+            ecg_emb = self.ecg_encoder(ecg)  # (B, output_dim)
+            return {
+                'ecg_emb': ecg_emb  # 投影在shared_step中做
+            }
         else:
-            # 单尺度模式：原有逻辑
+            # 原有单尺度模式
             ecg_emb = self.ecg_encoder(ecg)  # (B, output_dim)
             proj_ecg_emb = self.proj_e(ecg_emb)  # (B, proj_out)
             proj_ecg_emb = F.normalize(proj_ecg_emb, dim=-1)
@@ -464,6 +515,9 @@ class MVCSEMSSATEModel(BasePretrainModel):
         if self.use_multiscale:
             # 多尺度模式：返回原始text_emb，投影在shared_step中做
             return {'text_emb': text_emb}
+        elif self.ecg_encoder_name.startswith('hierarchical_') and not self.use_multiscale_pooler:
+            # 单尺度消融模式：返回原始text_emb，投影在shared_step中做
+            return {'text_emb': text_emb}
         else:
             # 单尺度模式：投影后返回
             proj_text_emb = self.proj_t(text_emb)
@@ -483,7 +537,7 @@ class MVCSEMSSATEModel(BasePretrainModel):
             mode: 多尺度模式下的融合方式 ('concat', 'mean', 'rhythm')
 
         Returns:
-            proj_ecg_emb: (B, 3*proj_out) for concat, (B, proj_out) for mean/rhythm
+            proj_ecg_emb: (B, 3*proj_out) for concat, (B, proj_out) for mean/rhythm/single
         """
         if self.use_multiscale:
             # 多尺度模式：获取三个层级特征并投影
@@ -501,8 +555,12 @@ class MVCSEMSSATEModel(BasePretrainModel):
                 proj_ecg_emb = rhythm_z
             else:
                 raise ValueError(f"Unknown mode: {mode}")
+        elif self.ecg_encoder_name.startswith('hierarchical_') and not self.use_multiscale_pooler:
+            # 单尺度消融模式
+            ecg_emb = self.ecg_encoder(ecg)
+            proj_ecg_emb = F.normalize(self.single_proj(ecg_emb), dim=-1)
         else:
-            # 单尺度模式
+            # 原有单尺度模式
             ecg_emb = self.ecg_encoder(ecg)
             proj_ecg_emb = self.proj_e(ecg_emb)
             proj_ecg_emb = F.normalize(proj_ecg_emb, dim=-1)
@@ -553,8 +611,11 @@ class MVCSEMSSATEModel(BasePretrainModel):
                 proj_text_emb = text_rhythm_z
             else:
                 raise ValueError(f"Unknown mode: {mode}")
+        elif self.ecg_encoder_name.startswith('hierarchical_') and not self.use_multiscale_pooler:
+            # 单尺度消融模式
+            proj_text_emb = F.normalize(self.text_single_proj(text_emb), dim=-1)
         else:
-            # 单尺度模式
+            # 原有单尺度模式
             proj_text_emb = self.proj_t(text_emb)
             proj_text_emb = F.normalize(proj_text_emb, dim=-1)
 
@@ -849,6 +910,62 @@ class MVCSEMSSATEModel(BasePretrainModel):
                     loss_dict['scale_attn_wave'] = scale_weights[0]
                     loss_dict['scale_attn_beat'] = scale_weights[1]
                     loss_dict['scale_attn_rhythm'] = scale_weights[2]
+        elif self.ecg_encoder_name.startswith('hierarchical_') and not self.use_multiscale_pooler:
+            # ========== 单尺度消融模式（使用与多尺度相同的语义增强loss）==========
+            rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+            world_size = torch.distributed.get_world_size() if torch.distributed.is_initialized() else 1
+
+            # ECG投影 + L2归一化
+            ecg_emb = ecg_output['ecg_emb']
+            single_z = F.normalize(self.single_proj(ecg_emb), dim=-1)
+
+            # Text投影 + L2归一化
+            text_emb = text_output['text_emb']
+            text_single_z = F.normalize(self.text_single_proj(text_emb), dim=-1)
+
+            logit_scale = self.logit_scale.exp()
+
+            # 使用软标签loss（与多尺度模式的rhythm尺度保持一致）
+            if self.use_learnable_sim:
+                # 更新分布式参数
+                self.single_soft_clip_loss.rank = rank
+                self.single_soft_clip_loss.world_size = world_size
+
+                # 计算文本语义相似度矩阵
+                with torch.no_grad():
+                    text_emb_norm = F.normalize(text_emb, dim=-1)
+                    if world_size > 1:
+                        gathered_text_emb = [torch.zeros_like(text_emb_norm) for _ in range(world_size)]
+                        torch.distributed.all_gather(gathered_text_emb, text_emb_norm.contiguous())
+                        all_text_emb_norm = torch.cat(gathered_text_emb, dim=0)
+                        text_sim_matrix = text_emb_norm @ all_text_emb_norm.T
+                    else:
+                        text_sim_matrix = text_emb_norm @ text_emb_norm.T
+
+                # 使用可学习软标签loss
+                loss_single = self.single_soft_clip_loss(
+                    single_z, text_single_z, logit_scale,
+                    sim_matrix=text_sim_matrix,
+                    threshold=self.learnable_threshold,
+                    soft_weight=self.learnable_soft_weight
+                )
+            else:
+                self.clip_loss.rank = rank
+                self.clip_loss.world_size = world_size
+                loss_single = self.clip_loss(single_z, text_single_z, logit_scale)
+
+            total_loss = loss_single
+
+            loss_dict = {
+                'loss': total_loss,
+                'loss_single': loss_single,
+                'logit_scale': logit_scale,
+            }
+
+            # 记录软标签参数
+            if self.use_learnable_sim:
+                loss_dict['single_threshold'] = torch.sigmoid(self.learnable_threshold).detach()
+                loss_dict['single_soft_weight'] = torch.sigmoid(self.learnable_soft_weight).detach()
         else:
             # ========== 单尺度对比学习（原有逻辑）==========
             loss_fn = ClipLoss(

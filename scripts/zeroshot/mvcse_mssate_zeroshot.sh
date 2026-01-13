@@ -5,7 +5,7 @@
 
 # ============ 配置区域 ============
 # 设置预训练模型的checkpoint路径
-CKPT_PATH="~/autodl-tmp/logs/mvcse_mssate/ckpts/mvcse_mssate_hierarchical_mvcse_mssate_base_2026_01_12_17_36_48/epoch=1-step=5824.ckpt"
+CKPT_PATH="~/autodl-tmp/logs/mvcse_mssate/ckpts/mvcse_mssate_hierarchical_mvcse_mssate_base_2026_01_13_04_02_38/epoch=1-step=5824.ckpt"
 
 # 多尺度融合模式: concat (拼接三个尺度), mean (三个尺度平均), rhythm (仅使用rhythm尺度)
 FUSION_MODE="concat"

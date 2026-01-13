@@ -121,6 +121,8 @@ def main(hparams: Namespace):
         ecg_encoder_name=hparams.ecg_encoder_name,
         embed_dim=hparams.embed_dim,
         seq_len=hparams.seq_len,
+        use_multiscale_pooler=hparams.use_multiscale_pooler,
+        resnet_type=hparams.resnet_type,
         # 新架构参数（方案B）
         lead_transformer_depth=hparams.lead_transformer_depth,
         lead_transformer_heads=hparams.lead_transformer_heads,
@@ -215,6 +217,17 @@ if __name__ == '__main__':
     parser.add_argument("--lead_group_strategy", type=str, default="none",
                         choices=["none", "limb_chest", "lisa"],
                         help="Lead grouping strategy: none (no grouping), limb_chest (2 groups), lisa (5 groups based on cardiac anatomy)")
+
+    # 多尺度消融参数
+    parser.add_argument("--use_multiscale_pooler", action="store_true", default=True,
+                        help="Use multi-scale pooler (wave/beat/rhythm)")
+    parser.add_argument("--no_multiscale_pooler", action="store_false", dest="use_multiscale_pooler",
+                        help="Disable multi-scale pooler (ablation study)")
+
+    # ResNet前端选择（消融实验）
+    parser.add_argument("--resnet_type", type=str, default="resnet18",
+                        choices=["resnet18", "resnet34"],
+                        help="ResNet frontend type for ECG feature extraction")
 
     # 文本编码器参数
     parser.add_argument("--num_freeze_layers", type=int, default=6,
