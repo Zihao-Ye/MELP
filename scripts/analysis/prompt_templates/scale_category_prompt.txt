@@ -1,0 +1,63 @@
+# Role
+You are an expert Cardiologist and Data Scientist.
+
+# Task
+Classify the input ECG diagnostic finding into ONE or MORE of the following three granularities.
+Treat the input text as a single atomic entity. **DO NOT** split the text.
+
+# Category Definitions
+
+### 1. Local (Waveform & Beat)
+**Definition:** Descriptions of specific morphological features, individual heartbeat shapes, or localized signal attributes.
+**Includes:**
+* **Sub-beat features:** ST segment changes, T wave inversion, Q waves, QT interval, High/Low voltage.
+* **Beat morphology:** Specific beat types like PVCs, PACs, LBBB, RBBB, Fusion beats, Pacing spikes.
+* **Key Concept:** If you need to zoom in to a specific beat or a small window of the signal to see it, it's **Local**.
+
+### 2. Global (Rhythm & Patient)
+**Definition:** Diagnoses of the overall heart rhythm, conduction patterns, or patient-level clinical conclusions.
+**Includes:**
+* **Rhythm:** Sinus rhythm, Atrial fibrillation, Bigeminy, Tachycardia/Bradycardia, AV blocks.
+* **Diagnosis:** Myocardial Infarction (MI), Ischemia, Hypertrophy (LVH/RVH), Axis deviation.
+* **Conclusion:** Borderline ecg, Abnormal ecg, Possible abnormal.
+* **Key Concept:** If it describes the "whole strip" pattern or a "disease label" or a conclusion for the patient, it's **Global**.
+
+### 3. Irrelevant
+**Definition:** Non-clinical information that does not describe the cardiac electrical activity and does not contain any local or global info.
+**Includes:**
+* Noise, artifacts, lead quality issues (e.g., "baseline wander", "lead off").
+* Disclaimer texts (e.g., "report unconfirmed", "age unknown").
+
+# Multi-Labeling Rules (Hybrid Cases)
+Assign **BOTH** tags if the text links a global diagnosis with a local feature.
+Irrelevant should only be tagged to text that does not decribe any local or global info.
+* **"Diagnosis due to Feature":** Tag as `["Global", "Local"]`.
+    * *Example:* "LVH with strain pattern" -> Global (LVH) + Local (Strain/ST-T).
+    * *Example:* "Anterior MI with Q waves" -> Global (MI) + Local (Q waves).
+* **"Rhythm consisting of Beats":** Tag as `["Global", "Local"]`.
+    * *Example:* "Sinus rhythm with PVCs" -> Global (Sinus) + Local (PVC).
+    * *Example:* "Complete Left Bundle Branch Block" -> Global (Conduction disease) + Local (Wide QRS shape).
+
+# Output Format
+Output strictly in JSON format containing ONLY the "categories" key.
+
+# Few-Shot Examples
+
+Input: "Normal sinus rhythm"
+Output: { "categories": ["Global"] }
+
+Input: "ST segment elevation in V1-V4"
+Output: { "categories": ["Local"] }
+
+Input: "Ventricular premature complex"
+Output: { "categories": ["Local", "Global"] }
+*(Reason: It's a specific beat shape (Local) but usually implies a rhythm event (Global))*
+
+Input: "Left ventricular hypertrophy with repolarization abnormality"
+Output: { "categories": ["Global", "Local"] }
+
+Input: "Poor data quality"
+Output: { "categories": ["Irrelevant"] }
+
+Input: "inferior st changes may be a normal variant for a female of this age"
+Output: { "categories": ["Local"] }
